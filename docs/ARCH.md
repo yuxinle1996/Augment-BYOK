@@ -15,13 +15,13 @@ Augment UI/逻辑
           -> Router (endpoint/model/rule -> byok|official|disabled)
               -> If byok: Provider(OpenAI|Anthropic) + ProtocolConverter
               -> If official: return undefined (走原生官方逻辑)
-              -> If disabled: 返回一致的可解释错误
+              -> If disabled: 本地 no-op（不发网络请求）
       -> 原生逻辑（官方）
 ```
 
 关键点：
 - **不全局改 completionURL**：避免把所有端点都“强行收进网关”，降低破坏面。
-- 只对“LLM 数据面端点”做拦截；非 LLM 端点默认 official（可对 `telemetry.disabled_endpoints` 做本地 no-op）。
+- 只对“LLM 数据面端点”做拦截；非 LLM 端点默认 official（可用 `routing.rules[endpoint].mode=disabled` 做本地 no-op）。
 
 ## 2. 注入/补丁面（必须小且可审计）
 

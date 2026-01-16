@@ -399,7 +399,13 @@ async function maybeHandleCallApi({ endpoint, body, transform, timeoutMs, abortS
 
   const route = decideRoute({ cfg, endpoint: ep, body, runtimeEnabled: state.runtimeEnabled });
   if (route.mode === "official") return undefined;
-  if (route.mode === "disabled") throw new Error(`BYOK disabled endpoint: ${ep}`);
+  if (route.mode === "disabled") {
+    try {
+      return safeTransform(transform, {}, `disabled:${ep}`);
+    } catch {
+      return {};
+    }
+  }
   if (route.mode !== "byok") return undefined;
 
   const t = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : cfg.timeouts.upstreamMs;
@@ -480,7 +486,7 @@ async function maybeHandleCallApiStream({ endpoint, body, transform, timeoutMs, 
 
   const route = decideRoute({ cfg, endpoint: ep, body, runtimeEnabled: state.runtimeEnabled });
   if (route.mode === "official") return undefined;
-  if (route.mode === "disabled") throw new Error(`BYOK disabled endpoint: ${ep}`);
+  if (route.mode === "disabled") return emptyAsyncGenerator();
   if (route.mode !== "byok") return undefined;
 
   const t = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : cfg.timeouts.upstreamMs;

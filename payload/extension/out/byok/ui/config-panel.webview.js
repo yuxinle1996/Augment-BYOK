@@ -7,10 +7,110 @@
 
   const { qs, normalizeStr, uniq, parseModelsTextarea, parseJsonOrEmptyObject, renderApp } = ns;
 
-  let uiState = { cfg: {}, summary: {}, status: "Ready.", clearOfficialToken: false, modal: null };
+  function getPersistedState() {
+    try { return vscode && typeof vscode.getState === "function" ? vscode.getState() : null; } catch { return null; }
+  }
+
+  function setPersistedState(patch) {
+    try {
+      if (!vscode || typeof vscode.setState !== "function") return;
+      const prev = getPersistedState();
+      const next = { ...(prev && typeof prev === "object" ? prev : {}), ...(patch && typeof patch === "object" ? patch : {}) };
+      vscode.setState(next);
+    } catch { }
+  }
+
+  const persisted = getPersistedState();
+  const persistedSideCollapsed = persisted && typeof persisted === "object" ? Boolean(persisted.sideCollapsed) : false;
+  const persistedEndpointSearch =
+    persisted && typeof persisted === "object"
+      ? normalizeStr(persisted.endpointSearch) || normalizeStr(persisted.telemetrySearch) || normalizeStr(persisted.routingAddSearch)
+      : "";
+
+  let uiState = {
+    cfg: {},
+    summary: {},
+    status: "Ready.",
+    clearOfficialToken: false,
+    modal: null,
+    dirty: false,
+    sideCollapsed: persistedSideCollapsed,
+    endpointSearch: persistedEndpointSearch
+  };
+
+  function updateDirtyBadge() {
+    const el = qs("#dirtyBadge");
+    if (!el) return;
+    el.textContent = uiState.dirty ? "pending" : "saved";
+  }
+
+  function updateStatusText(text) {
+    const el = qs("#status");
+    if (!el) return;
+    el.textContent = String(text ?? "");
+  }
+
+  function markDirty(statusText) {
+    if (!uiState.dirty) uiState.dirty = true;
+    if (statusText) uiState.status = String(statusText);
+    updateDirtyBadge();
+    if (statusText) updateStatusText(statusText);
+  }
+
+  function applyEndpointFilter() {
+    const inputEl = qs("#endpointSearch");
+    const raw = inputEl ? normalizeStr(inputEl.value) : normalizeStr(uiState.endpointSearch);
+    const q = raw.toLowerCase();
+
+    const rows = Array.from(document.querySelectorAll("[data-endpoint-row]"));
+    let visible = 0;
+    for (const row of rows) {
+      const ep = normalizeStr(row.getAttribute("data-endpoint-row"));
+      const desc = normalizeStr(row.getAttribute("data-endpoint-desc"));
+      const hay = `${ep} ${desc}`.toLowerCase();
+      const match = !q || hay.includes(q);
+      row.hidden = !match;
+      if (match) visible += 1;
+    }
+
+    const groups = Array.from(document.querySelectorAll("[data-endpoint-group]"));
+    for (const g of groups) {
+      const items = Array.from(g.querySelectorAll("[data-endpoint-row]"));
+      const totalInGroup = items.length;
+      const visibleInGroup = items.reduce((n, el) => (el && !el.hidden ? n + 1 : n), 0);
+      const anyVisible = visibleInGroup > 0;
+      g.hidden = !anyVisible;
+      if (q && anyVisible && typeof g.open === "boolean") g.open = true;
+
+      const badge = g.querySelector ? g.querySelector("[data-endpoint-group-count-badge]") : null;
+      if (badge) badge.textContent = q ? `显示 ${visibleInGroup} / ${totalInGroup}` : `${totalInGroup} total`;
+    }
+
+    const countEl = qs("#endpointFilterCount");
+    if (countEl) countEl.textContent = rows.length ? `显示 ${visible} / ${rows.length}` : "";
+  }
+
+  function setEndpointSearch(next) {
+    uiState.endpointSearch = normalizeStr(next);
+    setPersistedState({ endpointSearch: uiState.endpointSearch });
+    applyEndpointFilter();
+  }
 
   function render() {
-    qs("#app").innerHTML = renderApp(uiState);
+    const app = qs("#app");
+    const prevMain = app?.querySelector ? app.querySelector(".main") : null;
+    const prevSide = app?.querySelector ? app.querySelector(".side") : null;
+    const mainScrollTop = prevMain ? prevMain.scrollTop : 0;
+    const sideScrollTop = prevSide ? prevSide.scrollTop : 0;
+
+    if (app) app.innerHTML = renderApp(uiState);
+
+    const nextMain = app?.querySelector ? app.querySelector(".main") : null;
+    const nextSide = app?.querySelector ? app.querySelector(".side") : null;
+    if (nextMain) nextMain.scrollTop = mainScrollTop;
+    if (nextSide) nextSide.scrollTop = sideScrollTop;
+
+    applyEndpointFilter();
   }
 
   function applyProvidersEditsFromDom(cfg) {
@@ -30,11 +130,11 @@
         continue;
       }
       if (key === "headers") {
-        try { p.headers = parseJsonOrEmptyObject(el.value); } catch {}
+        try { p.headers = parseJsonOrEmptyObject(el.value); } catch { }
         continue;
       }
       if (key === "requestDefaults") {
-        try { p.requestDefaults = parseJsonOrEmptyObject(el.value); } catch {}
+        try { p.requestDefaults = parseJsonOrEmptyObject(el.value); } catch { }
         continue;
       }
 
@@ -97,19 +197,56 @@
     applyProvidersEditsFromDom(cfg);
     applyRulesEditsFromDom(cfg);
 
+    cfg.routing = cfg.routing && typeof cfg.routing === "object" ? cfg.routing : {};
+    cfg.routing.rules = cfg.routing.rules && typeof cfg.routing.rules === "object" ? cfg.routing.rules : {};
+    for (const ep of Object.keys(cfg.routing.rules)) {
+      const r = cfg.routing.rules[ep] && typeof cfg.routing.rules[ep] === "object" ? cfg.routing.rules[ep] : null;
+      const mode = normalizeStr(r?.mode);
+      if (!r || !mode) {
+        delete cfg.routing.rules[ep];
+        continue;
+      }
+      if (mode !== "byok") {
+        r.providerId = "";
+        r.model = "";
+      }
+    }
+
     cfg.telemetry = cfg.telemetry && typeof cfg.telemetry === "object" ? cfg.telemetry : {};
-    cfg.telemetry.disabledEndpoints = uniq(String(qs("#telemetryDisabled")?.value ?? "").split("\n").map((x) => normalizeStr(x)));
+    cfg.telemetry.disabledEndpoints = [];
 
     return cfg;
+  }
+
+  function migrateLegacyTelemetryDisabledEndpointsToRules(cfg) {
+    const c = cfg && typeof cfg === "object" ? cfg : {};
+    const out = JSON.parse(JSON.stringify(c));
+    const disabled = Array.isArray(out?.telemetry?.disabledEndpoints) ? out.telemetry.disabledEndpoints : [];
+    if (disabled.length) {
+      out.routing = out.routing && typeof out.routing === "object" ? out.routing : {};
+      out.routing.rules = out.routing.rules && typeof out.routing.rules === "object" ? out.routing.rules : {};
+      for (const epRaw of disabled) {
+        const ep = normalizeStr(epRaw);
+        if (!ep) continue;
+        const r = out.routing.rules[ep] && typeof out.routing.rules[ep] === "object" ? out.routing.rules[ep] : (out.routing.rules[ep] = {});
+        r.mode = "disabled";
+        r.providerId = "";
+        r.model = "";
+      }
+    }
+    out.telemetry = out.telemetry && typeof out.telemetry === "object" ? out.telemetry : {};
+    out.telemetry.disabledEndpoints = [];
+    return out;
   }
 
   function setUiState(patch, { preserveEdits = true } = {}) {
     if (preserveEdits) {
       try {
         if (qs("#enabled")) uiState.cfg = gatherConfigFromDom();
-      } catch {}
+      } catch { }
     }
     uiState = { ...uiState, ...(patch || {}) };
+    if (patch && typeof patch === "object" && "sideCollapsed" in patch) setPersistedState({ sideCollapsed: Boolean(uiState.sideCollapsed) });
     render();
   }
 
@@ -117,7 +254,7 @@
     const msg = ev.data;
     const t = msg && typeof msg === "object" ? msg.type : "";
     if (t === "status") setUiState({ status: msg.status || "" }, { preserveEdits: true });
-    if (t === "render") setUiState({ cfg: msg.config || {}, summary: msg.summary || {}, status: "Ready.", clearOfficialToken: false, modal: null }, { preserveEdits: false });
+    if (t === "render") setUiState({ cfg: migrateLegacyTelemetryDisabledEndpointsToRules(msg.config || {}), summary: msg.summary || {}, clearOfficialToken: false, modal: null, dirty: false }, { preserveEdits: false });
     if (t === "providerModelsFetched") {
       const idx = Number(msg.idx);
       const models = Array.isArray(msg.models) ? msg.models : [];
@@ -129,7 +266,7 @@
       const dm = normalizeStr(cfg.providers[idx].defaultModel);
       if (dm && !cfg.providers[idx].models.includes(dm)) cfg.providers[idx].models = uniq(cfg.providers[idx].models.concat([dm]));
       if (!dm) cfg.providers[idx].defaultModel = cfg.providers[idx].models[0] || "";
-      return setUiState({ cfg, status: "Models fetched (pending save)." }, { preserveEdits: false });
+      return setUiState({ cfg, status: "Models fetched (pending save).", dirty: true }, { preserveEdits: false });
     }
     if (t === "providerModelsFailed") return setUiState({ status: msg.error || "Fetch models failed." }, { preserveEdits: true });
   });
@@ -140,7 +277,7 @@
     const action = btn.getAttribute("data-action");
 
     if (action === "clearOfficialToken") {
-      setUiState({ clearOfficialToken: true, status: "Official token cleared (pending save)." }, { preserveEdits: true });
+      setUiState({ clearOfficialToken: true, status: "Official token cleared (pending save).", dirty: true }, { preserveEdits: true });
       return;
     }
 
@@ -176,14 +313,14 @@
       else {
         try { kind === "headers" ? (p.headers = parseJsonOrEmptyObject(text)) : (p.requestDefaults = parseJsonOrEmptyObject(text)); } catch { return setUiState({ status: "Invalid JSON (kept modal open)." }, { preserveEdits: true }); }
       }
-      return setUiState({ cfg, modal: null, status: "Updated (pending save)." }, { preserveEdits: false });
+      return setUiState({ cfg, modal: null, status: "Updated (pending save).", dirty: true }, { preserveEdits: false });
     }
 
     if (action === "addProvider") {
       const cfg = gatherConfigFromDom();
       cfg.providers = Array.isArray(cfg.providers) ? cfg.providers : [];
       cfg.providers.push({ id: `provider_${cfg.providers.length + 1}`, type: "openai_compatible", baseUrl: "", apiKey: "", models: [], defaultModel: "", headers: {}, requestDefaults: {} });
-      setUiState({ cfg, status: "Provider added (pending save)." }, { preserveEdits: false });
+      setUiState({ cfg, status: "Provider added (pending save).", dirty: true }, { preserveEdits: false });
       return;
     }
 
@@ -192,7 +329,7 @@
       const cfg = gatherConfigFromDom();
       cfg.providers = Array.isArray(cfg.providers) ? cfg.providers : [];
       if (Number.isFinite(idx) && idx >= 0 && idx < cfg.providers.length) cfg.providers.splice(idx, 1);
-      setUiState({ cfg, status: "Provider removed (pending save)." }, { preserveEdits: false });
+      setUiState({ cfg, status: "Provider removed (pending save).", dirty: true }, { preserveEdits: false });
       return;
     }
 
@@ -201,32 +338,25 @@
       const cfg = gatherConfigFromDom();
       cfg.providers = Array.isArray(cfg.providers) ? cfg.providers : [];
       if (cfg.providers[idx]) cfg.providers[idx].apiKey = "";
-      setUiState({ cfg, status: "Provider apiKey cleared (pending save)." }, { preserveEdits: false });
+      setUiState({ cfg, status: "Provider apiKey cleared (pending save).", dirty: true }, { preserveEdits: false });
       return;
     }
 
-    if (action === "addRule") {
-      const ep = normalizeStr(qs("#newRuleEndpoint")?.value);
-      if (!ep.startsWith("/")) return setUiState({ status: "Endpoint must start with /" }, { preserveEdits: true });
-      const cfg = gatherConfigFromDom();
-      cfg.routing = cfg.routing && typeof cfg.routing === "object" ? cfg.routing : {};
-      cfg.routing.rules = cfg.routing.rules && typeof cfg.routing.rules === "object" ? cfg.routing.rules : {};
-      if (!cfg.routing.rules[ep]) cfg.routing.rules[ep] = { mode: "official", providerId: "", model: "" };
-      setUiState({ cfg, status: `Rule added: ${ep} (pending save).` }, { preserveEdits: false });
-      return;
+    if (action === "save") {
+      vscode.postMessage({ type: "save", config: gatherConfigFromDom() });
+      return setUiState({ status: "Saving..." }, { preserveEdits: true });
     }
-
-    if (action === "removeRule") {
-      const ep = btn.getAttribute("data-ep");
-      const cfg = gatherConfigFromDom();
-      if (cfg.routing && cfg.routing.rules && cfg.routing.rules[ep]) delete cfg.routing.rules[ep];
-      setUiState({ cfg, status: `Rule removed: ${ep} (pending save).` }, { preserveEdits: false });
-      return;
-    }
-
-    if (action === "save") return vscode.postMessage({ type: "save", config: gatherConfigFromDom() });
     if (action === "reset") return setUiState({ modal: { kind: "confirmReset" } }, { preserveEdits: true });
-    if (action === "reload") return vscode.postMessage({ type: "reload" });
+    if (action === "reload") {
+      vscode.postMessage({ type: "reload" });
+      return setUiState({ status: "Reloading..." }, { preserveEdits: true });
+    }
+    if (action === "toggleRuntime") {
+      const enabled = Boolean(uiState?.summary?.runtimeEnabled);
+      vscode.postMessage({ type: enabled ? "disableRuntime" : "enableRuntime" });
+      return setUiState({ status: enabled ? "Disabling runtime..." : "Enabling runtime..." }, { preserveEdits: true });
+    }
+    if (action === "toggleSide") return setUiState({ sideCollapsed: !uiState.sideCollapsed }, { preserveEdits: true });
     if (action === "disableRuntime") return vscode.postMessage({ type: "disableRuntime" });
     if (action === "enableRuntime") return vscode.postMessage({ type: "enableRuntime" });
   });
@@ -234,17 +364,72 @@
   document.addEventListener("change", (ev) => {
     const el = ev.target;
     if (!el || typeof el.matches !== "function") return;
-    if (el.matches("[data-rule-key=\"providerId\"]")) return setUiState({ status: "Rule provider changed (pending save)." }, { preserveEdits: true });
-    if (el.matches("[data-p-key=\"type\"],[data-p-key=\"defaultModel\"]")) return setUiState({ status: "Provider updated (pending save)." }, { preserveEdits: true });
+
+    if (el.matches("[data-rule-ep][data-rule-key]")) {
+      const ep = normalizeStr(el.getAttribute("data-rule-ep"));
+      const key = normalizeStr(el.getAttribute("data-rule-key"));
+      const cfg = gatherConfigFromDom();
+      cfg.routing = cfg.routing && typeof cfg.routing === "object" ? cfg.routing : {};
+      cfg.routing.rules = cfg.routing.rules && typeof cfg.routing.rules === "object" ? cfg.routing.rules : {};
+
+      if (key === "mode") {
+        const nextMode = normalizeStr(el.value);
+        if (!nextMode) {
+          if (cfg.routing.rules[ep]) delete cfg.routing.rules[ep];
+          return setUiState({ cfg, status: `Rule cleared: ${ep} (use default, pending save).`, dirty: true }, { preserveEdits: false });
+        }
+        const r = cfg.routing.rules[ep] && typeof cfg.routing.rules[ep] === "object" ? cfg.routing.rules[ep] : (cfg.routing.rules[ep] = {});
+        r.mode = nextMode;
+        if (nextMode !== "byok") {
+          r.providerId = "";
+          r.model = "";
+        }
+        return setUiState({ cfg, status: `Rule mode changed: ${ep} (pending save).`, dirty: true }, { preserveEdits: false });
+      }
+
+      if (key === "providerId") {
+        const r = cfg.routing.rules[ep] && typeof cfg.routing.rules[ep] === "object" ? cfg.routing.rules[ep] : (cfg.routing.rules[ep] = {});
+        r.mode = "byok";
+        const pid = normalizeStr(r.providerId);
+        if (!pid) {
+          r.model = "";
+        } else {
+          const ps = Array.isArray(cfg.providers) ? cfg.providers : [];
+          const p = ps.find((x) => normalizeStr(x?.id) === pid);
+          const models = Array.isArray(p?.models) ? p.models.map((m) => normalizeStr(m)).filter(Boolean) : [];
+          const m = normalizeStr(r.model);
+          if (m && models.length && !models.includes(m)) r.model = "";
+        }
+        return setUiState({ cfg, status: `Rule provider changed: ${ep} (pending save).`, dirty: true }, { preserveEdits: false });
+      }
+
+      if (key === "model") {
+        const r = cfg.routing.rules[ep] && typeof cfg.routing.rules[ep] === "object" ? cfg.routing.rules[ep] : (cfg.routing.rules[ep] = {});
+        r.mode = "byok";
+        return setUiState({ cfg, status: `Rule model changed: ${ep} (pending save).`, dirty: true }, { preserveEdits: false });
+      }
+
+      return setUiState({ cfg, status: `Rule updated: ${ep} (pending save).`, dirty: true }, { preserveEdits: false });
+    }
+
+    if (el.matches("[data-p-key=\"type\"],[data-p-key=\"defaultModel\"]")) return setUiState({ status: "Provider updated (pending save).", dirty: true }, { preserveEdits: true });
+  });
+
+  document.addEventListener("input", (ev) => {
+    const el = ev.target;
+    if (!el || typeof el.matches !== "function") return;
+    if (el.matches("#endpointSearch")) return setEndpointSearch(el.value);
+    if (el.matches("#modalText")) return;
+    if (el.matches("input[type=\"text\"],input[type=\"number\"],input[type=\"password\"],textarea")) return markDirty("Edited (pending save).");
   });
 
   function init() {
     try {
       const initEl = qs("#byokInit");
       const init = initEl ? JSON.parse(initEl.textContent || "{}") : {};
-      setUiState({ cfg: init.config || {}, summary: init.summary || {}, status: "Ready.", clearOfficialToken: false }, { preserveEdits: false });
+      setUiState({ cfg: migrateLegacyTelemetryDisabledEndpointsToRules(init.config || {}), summary: init.summary || {}, status: "Ready.", clearOfficialToken: false, dirty: false }, { preserveEdits: false });
     } catch {
-      setUiState({ cfg: {}, summary: {}, status: "Init failed.", clearOfficialToken: false }, { preserveEdits: false });
+      setUiState({ cfg: {}, summary: {}, status: "Init failed.", clearOfficialToken: false, dirty: false }, { preserveEdits: false });
     }
     vscode.postMessage({ type: "init" });
   }

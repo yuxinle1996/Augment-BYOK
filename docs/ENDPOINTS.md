@@ -83,7 +83,7 @@
 
 ## 7) 反馈/遥测/调试（非 LLM，通常可保持 official 或按需禁用）
 
-建议默认 disabled（本地 no-op）：`/client-*`、`/record-*`、`/report-*`、`/resolve-*`（见默认配置的 `telemetry.disabledEndpoints`，可在 `BYOK: Open Config Panel` 调整）。
+建议默认 disabled（本地 no-op）：`/client-*`、`/record-*`、`/report-*`、`/resolve-*`（见默认配置 `routing.rules` 中对应 endpoint 的 `mode=disabled`，可在 `BYOK: Open Config Panel` 调整）。
 
 显式反馈：
 - `/chat-feedback`：聊天反馈。

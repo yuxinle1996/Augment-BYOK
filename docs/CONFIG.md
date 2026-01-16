@@ -5,7 +5,7 @@
 - 不使用 VS Code settings（彻底禁用 `augment.advanced.*` 的干预面）。
 - 不使用 env / 外部 YAML：配置与 Key/Token 由扩展内部持久化，并可一键导出/导入 JSON。
 - 热更新：保存后对后续请求立即生效；错误配置不致命（保留 last-good）。
-- 默认策略：`enabled=true`；仅覆盖 13 个 LLM 端点；其它端点默认 official；部分遥测端点可本地 no-op。
+- 默认策略：`enabled=true`；仅覆盖 13 个 LLM 端点；其它端点默认 official；部分遥测端点默认 disabled（本地 no-op）。
 
 ## 2) 配置存储位置
 
@@ -24,9 +24,14 @@
 
 导入方式：打开面板 `BYOK: Open Config Panel` → `Import JSON` → 粘贴 → `Import & Save`。
 
+注意（Official completionUrl）：
+- 上游会从 `completionUrl` 的**子域名**提取 `tenantId`（例如 `https://your-tenant.augmentcode.com/` → `your-tenant`）。
+- 如果你需要使用官方控制面能力（如 Preferences → Secrets Manager / Remote Agents），请确保 `official.completionUrl` 是你的 tenant URL；否则可能出现 `Not Found`。
+
 ## 4) 模型与路由约定
 
 - BYOK 模型 ID 统一格式：`byok:<providerId>:<modelId>`
+- `routing.rules[endpoint].mode` 支持：`official` / `byok` / `disabled`（本地 no-op，不发网络请求）。
 - 模型选择优先级（无 `model_map`）：
   1) 请求体 `model` 是 `byok:*` → 解析得到 provider+modelId（与 Proxy 语义一致）
   2) 路由规则 `providerId/model` 显式指定 → 强制使用

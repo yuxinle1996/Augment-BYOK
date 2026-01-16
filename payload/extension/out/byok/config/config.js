@@ -84,23 +84,23 @@ function defaultConfig() {
         "/next-edit-stream": { mode: "byok" },
         "/generate-commit-message-stream": { mode: "byok" },
         "/generate-conversation-title": { mode: "byok" },
-        "/next_edit_loc": { mode: "byok" }
+        "/next_edit_loc": { mode: "byok" },
+
+        "/client-metrics": { mode: "disabled" },
+        "/client-completion-timelines": { mode: "disabled" },
+        "/record-preference-sample": { mode: "disabled" },
+        "/record-request-events": { mode: "disabled" },
+        "/record-session-events": { mode: "disabled" },
+        "/record-user-events": { mode: "disabled" },
+        "/report-error": { mode: "disabled" },
+        "/resolve-completions": { mode: "disabled" },
+        "/resolve-edit": { mode: "disabled" },
+        "/resolve-instruction": { mode: "disabled" }
       }
     },
     timeouts: { upstreamMs: 120000 },
     telemetry: {
-      disabledEndpoints: [
-        "/client-metrics",
-        "/client-completion-timelines",
-        "/record-preference-sample",
-        "/record-request-events",
-        "/record-session-events",
-        "/record-user-events",
-        "/report-error",
-        "/resolve-completions",
-        "/resolve-edit",
-        "/resolve-instruction"
-      ]
+      disabledEndpoints: []
     }
   };
 }
