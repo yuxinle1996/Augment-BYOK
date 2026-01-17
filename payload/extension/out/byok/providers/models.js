@@ -1,6 +1,6 @@
 "use strict";
 
-const { normalizeString, requireString } = require("../infra/util");
+const { normalizeString, requireString, normalizeRawToken } = require("../infra/util");
 const { joinBaseUrl, safeFetch, readTextLimit } = require("./http");
 const { openAiAuthHeaders, anthropicAuthHeaders } = require("./headers");
 
@@ -51,7 +51,9 @@ async function fetchModelsWithFallback({ urls, headers, timeoutMs, abortSignal, 
 
 async function fetchOpenAiCompatibleModels({ baseUrl, apiKey, extraHeaders, timeoutMs, abortSignal }) {
   const b = requireString(baseUrl, "OpenAI baseUrl");
-  const key = requireString(apiKey, "OpenAI apiKey");
+  const key = normalizeRawToken(apiKey);
+  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
+  if (!key && Object.keys(extra).length === 0) throw new Error("OpenAI apiKey 未配置（且 headers 为空）");
   const urls = [joinBaseUrl(b, "models")];
   if (!b.includes("/v1")) urls.push(joinBaseUrl(b, "v1/models"));
 
@@ -66,7 +68,9 @@ async function fetchOpenAiCompatibleModels({ baseUrl, apiKey, extraHeaders, time
 
 async function fetchAnthropicModels({ baseUrl, apiKey, extraHeaders, timeoutMs, abortSignal }) {
   const b = requireString(baseUrl, "Anthropic baseUrl");
-  const key = requireString(apiKey, "Anthropic apiKey");
+  const key = normalizeRawToken(apiKey);
+  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
+  if (!key && Object.keys(extra).length === 0) throw new Error("Anthropic apiKey 未配置（且 headers 为空）");
   const urls = [joinBaseUrl(b, "models")];
   if (!b.includes("/v1")) urls.push(joinBaseUrl(b, "v1/models"));
 
@@ -79,6 +83,36 @@ async function fetchAnthropicModels({ baseUrl, apiKey, extraHeaders, timeoutMs, 
   });
 }
 
+async function fetchGeminiAiStudioModels({ baseUrl, apiKey, extraHeaders, timeoutMs, abortSignal }) {
+  const b = requireString(baseUrl, "Gemini baseUrl");
+  const key = normalizeRawToken(apiKey);
+  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
+  if (!key && Object.keys(extra).length === 0) throw new Error("Gemini apiKey 未配置（且 headers 为空）");
+  const urls = [joinBaseUrl(b, "models")];
+  if (!b.includes("/v1beta")) urls.push(joinBaseUrl(b, "v1beta/models"));
+
+  const withKey = urls
+    .map((u) => {
+      if (!u) return "";
+      try {
+        const url = new URL(u);
+        if (key) url.searchParams.set("key", key);
+        return url.toString();
+      } catch {
+        return u;
+      }
+    })
+    .filter(Boolean);
+
+  return await fetchModelsWithFallback({
+    urls: withKey,
+    headers: extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {},
+    timeoutMs,
+    abortSignal,
+    label: "Gemini(models)"
+  });
+}
+
 async function fetchProviderModels({ provider, timeoutMs, abortSignal }) {
   if (!provider || typeof provider !== "object") throw new Error("provider 无效");
   const type = normalizeString(provider.type);
@@ -88,7 +122,9 @@ async function fetchProviderModels({ provider, timeoutMs, abortSignal }) {
 
   const t = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : 15000;
   if (type === "openai_compatible") return await fetchOpenAiCompatibleModels({ baseUrl, apiKey, extraHeaders, timeoutMs: t, abortSignal });
+  if (type === "openai_responses") return await fetchOpenAiCompatibleModels({ baseUrl, apiKey, extraHeaders, timeoutMs: t, abortSignal });
   if (type === "anthropic") return await fetchAnthropicModels({ baseUrl, apiKey, extraHeaders, timeoutMs: t, abortSignal });
+  if (type === "gemini_ai_studio") return await fetchGeminiAiStudioModels({ baseUrl, apiKey, extraHeaders, timeoutMs: t, abortSignal });
   throw new Error(`未知 provider.type: ${type}`);
 }
 

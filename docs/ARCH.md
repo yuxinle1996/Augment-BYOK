@@ -60,6 +60,7 @@ Augment UI/逻辑
 - `Router`：输入 `(endpoint, requestBody, selectedModel, config)` 输出 `(mode, provider, model)`。
 - `ModelRegistry`：`/get-models` 必须注入 `enableModelRegistry/modelRegistry/modelInfoRegistry` 等 feature_flags，否则主面板 Model Picker 入口会被隐藏。
 - `AugmentProtocol`：解析 Augment 请求（尤其 `/chat-stream`），输出 canonical request；把 provider stream 转回 Augment NDJSON。
+- `ToolPairing`：对齐“工具调用必须配对”的上游硬约束（OpenAI/Anthropic）。在构造 messages 前修复缺失/孤儿 tool_result，避免 400 硬失败。
 - `Providers`
   - `OpenAICompatible`：`/chat/completions` streaming（SSE）
   - `Anthropic`：`/messages` streaming（SSE）

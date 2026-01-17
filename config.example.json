@@ -17,6 +17,16 @@
       "requestDefaults": { "temperature": 0.2 }
     },
     {
+      "id": "codex",
+      "type": "openai_responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-your-openai-api-key",
+      "models": ["gpt-4o-mini"],
+      "defaultModel": "gpt-4o-mini",
+      "headers": {},
+      "requestDefaults": { "reasoning": { "effort": "medium" } }
+    },
+    {
       "id": "anthropic",
       "type": "anthropic",
       "baseUrl": "https://api.anthropic.com/v1",
@@ -25,6 +35,16 @@
       "defaultModel": "claude-3-5-sonnet-20241022",
       "headers": {},
       "requestDefaults": { "max_tokens": 8192 }
+    },
+    {
+      "id": "gemini",
+      "type": "gemini_ai_studio",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+      "apiKey": "AIza-your-gemini-api-key",
+      "models": ["models/gemini-1.5-flash", "models/gemini-1.5-pro"],
+      "defaultModel": "models/gemini-1.5-flash",
+      "headers": {},
+      "requestDefaults": { "generationConfig": { "temperature": 0.2 } }
     }
   ],
   "routing": {

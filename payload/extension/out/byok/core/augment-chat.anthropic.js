@@ -1,7 +1,9 @@
 "use strict";
 
 const { normalizeString } = require("../infra/util");
+const { debug } = require("../infra/log");
 const shared = require("./augment-chat.shared");
+const { repairAnthropicToolUsePairs } = require("./tool-pairing");
 const { getChatHistoryAndRequestNodesForAPI } = require("./augment-history-summary");
 const {
   REQUEST_NODE_TEXT,
@@ -135,16 +137,16 @@ function buildAnthropicMessages(req) {
 
   for (let i = 0; i < history.length; i++) {
     const h = history[i];
-    const reqNodes = [...shared.asArray(h.request_nodes), ...shared.asArray(h.structured_request_nodes), ...shared.asArray(h.nodes)];
+    const reqNodes = shared.collectExchangeRequestNodes(h);
     const userBlocks = buildAnthropicUserContentBlocks(h.request_message, reqNodes, false);
     if (userBlocks.length) messages.push({ role: "user", content: userBlocks.length === 1 && userBlocks[0].type === "text" ? userBlocks[0].text : userBlocks });
-    const outNodes = [...shared.asArray(h.response_nodes), ...shared.asArray(h.structured_output_nodes)];
+    const outNodes = shared.collectExchangeOutputNodes(h);
     const assistantText = normalizeString(h.response_text) ? h.response_text : shared.extractAssistantTextFromOutputNodes(outNodes);
     const assistantBlocks = buildAnthropicAssistantContentBlocks(assistantText, outNodes);
     if (assistantBlocks.length) messages.push({ role: "assistant", content: assistantBlocks.length === 1 && assistantBlocks[0].type === "text" ? assistantBlocks[0].text : assistantBlocks });
     const next = i + 1 < history.length ? history[i + 1] : null;
     if (next) {
-      const trBlocks = buildAnthropicToolResultsBlocks([...shared.asArray(next.request_nodes), ...shared.asArray(next.structured_request_nodes), ...shared.asArray(next.nodes)]);
+      const trBlocks = buildAnthropicToolResultsBlocks(shared.collectExchangeRequestNodes(next));
       if (trBlocks.length) messages.push({ role: "user", content: trBlocks });
     }
   }
@@ -157,7 +159,13 @@ function buildAnthropicMessages(req) {
     if (s) userBlocks.push({ type: "text", text: s });
   }
   if (userBlocks.length) messages.push({ role: "user", content: userBlocks.length === 1 && userBlocks[0].type === "text" ? userBlocks[0].text : userBlocks });
-  return messages;
+  const repaired = repairAnthropicToolUsePairs(messages);
+  if (repaired?.report?.injected_missing_tool_results || repaired?.report?.converted_orphan_tool_results) {
+    debug(
+      `anthropic tool pairing repaired: injected_missing=${Number(repaired.report.injected_missing_tool_results) || 0} converted_orphan=${Number(repaired.report.converted_orphan_tool_results) || 0}`
+    );
+  }
+  return repaired && Array.isArray(repaired.messages) ? repaired.messages : messages;
 }
 
 module.exports = { buildAnthropicMessages };

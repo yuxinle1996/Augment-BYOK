@@ -2,8 +2,9 @@
 
 const { joinBaseUrl, safeFetch, readTextLimit } = require("./http");
 const { parseSse } = require("./sse");
-const { normalizeString, requireString } = require("../infra/util");
+const { normalizeString, requireString, normalizeRawToken } = require("../infra/util");
 const { withJsonContentType, openAiAuthHeaders } = require("./headers");
+const { normalizeUsageInt, makeToolMetaGetter, assertSseResponse } = require("./provider-util");
 const {
   STOP_REASON_END_TURN,
   STOP_REASON_TOOL_USE_REQUESTED,
@@ -11,24 +12,32 @@ const {
   rawResponseNode,
   toolUseStartNode,
   toolUseNode,
+  thinkingNode,
   mainTextFinishedNode,
   tokenUsageNode,
   makeBackChatChunk
 } = require("../core/augment-protocol");
 
-function buildOpenAiRequest({ baseUrl, apiKey, model, messages, extraHeaders, requestDefaults, stream }) {
+function buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools, extraHeaders, requestDefaults, stream, includeUsage }) {
   const url = joinBaseUrl(requireString(baseUrl, "OpenAI baseUrl"), "chat/completions");
-  const key = requireString(apiKey, "OpenAI apiKey");
+  const key = normalizeRawToken(apiKey);
+  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
+  if (!key && Object.keys(extra).length === 0) throw new Error("OpenAI apiKey 未配置（且 headers 为空）");
   const m = requireString(model, "OpenAI model");
   if (!Array.isArray(messages) || !messages.length) throw new Error("OpenAI messages 为空");
   const body = { ...(requestDefaults && typeof requestDefaults === "object" ? requestDefaults : null), model: m, messages, stream: Boolean(stream) };
+  if (stream && includeUsage) body.stream_options = { include_usage: true };
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
   const headers = withJsonContentType(openAiAuthHeaders(key, extraHeaders));
   if (stream) headers.accept = "text/event-stream";
   return { url, headers, body };
 }
 
 async function openAiCompleteText({ baseUrl, apiKey, model, messages, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
-  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, extraHeaders, requestDefaults, stream: false });
+  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools: [], extraHeaders, requestDefaults, stream: false, includeUsage: false });
   const resp = await safeFetch(
     url,
     {
@@ -47,7 +56,7 @@ async function openAiCompleteText({ baseUrl, apiKey, model, messages, timeoutMs,
 }
 
 async function* openAiStreamTextDeltas({ baseUrl, apiKey, model, messages, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
-  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, extraHeaders, requestDefaults, stream: true });
+  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools: [], extraHeaders, requestDefaults, stream: true, includeUsage: false });
   const resp = await safeFetch(
     url,
     {
@@ -59,11 +68,7 @@ async function* openAiStreamTextDeltas({ baseUrl, apiKey, model, messages, timeo
   );
 
   if (!resp.ok) throw new Error(`OpenAI(stream) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
-  const contentType = normalizeString(resp.headers?.get?.("content-type")).toLowerCase();
-  if (!contentType.includes("text/event-stream")) {
-    const preview = await readTextLimit(resp, 500);
-    throw new Error(`OpenAI(stream) 响应不是 SSE（content-type=${contentType || "unknown"}）；请确认 baseUrl 指向 OpenAI /chat/completions；body: ${preview}`.trim());
-  }
+  await assertSseResponse(resp, { label: "OpenAI(stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /chat/completions" });
   let dataEvents = 0;
   let parsedChunks = 0;
   let emitted = 0;
@@ -93,42 +98,25 @@ function ensureToolCallRecord(toolCallsByIndex, index) {
   return toolCallsByIndex.get(idx);
 }
 
-function buildOpenAiChatStreamRequest({ baseUrl, apiKey, model, messages, tools, extraHeaders, requestDefaults }) {
-  const url = joinBaseUrl(requireString(baseUrl, "OpenAI baseUrl"), "chat/completions");
-  const key = requireString(apiKey, "OpenAI apiKey");
-  const m = requireString(model, "OpenAI model");
-  if (!Array.isArray(messages) || !messages.length) throw new Error("OpenAI messages 为空");
-  const body = { ...(requestDefaults && typeof requestDefaults === "object" ? requestDefaults : null), model: m, messages, stream: true, stream_options: { include_usage: true } };
-  if (Array.isArray(tools) && tools.length) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
-  const headers = withJsonContentType(openAiAuthHeaders(key, extraHeaders));
-  headers.accept = "text/event-stream";
-  return { url, headers, body };
-}
-
 async function* openAiChatStreamChunks({ baseUrl, apiKey, model, messages, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart }) {
-  const { url, headers, body } = buildOpenAiChatStreamRequest({ baseUrl, apiKey, model, messages, tools, extraHeaders, requestDefaults });
+  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools, extraHeaders, requestDefaults, stream: true, includeUsage: true });
   const resp = await safeFetch(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(chat-stream)" });
   if (!resp.ok) throw new Error(`OpenAI(chat-stream) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
-  const contentType = normalizeString(resp.headers?.get?.("content-type")).toLowerCase();
-  if (!contentType.includes("text/event-stream")) {
-    const preview = await readTextLimit(resp, 500);
-    throw new Error(`OpenAI(chat-stream) 响应不是 SSE（content-type=${contentType || "unknown"}）；请确认 baseUrl 指向 OpenAI /chat/completions SSE；body: ${preview}`.trim());
-  }
+  await assertSseResponse(resp, { label: "OpenAI(chat-stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /chat/completions SSE" });
 
-  const metaMap = toolMetaByName instanceof Map ? toolMetaByName : new Map();
-  const getToolMeta = (toolName) => metaMap.get(toolName) || {};
+  const getToolMeta = makeToolMetaGetter(toolMetaByName);
 
   const toolCallsByIndex = new Map();
   let nodeId = 0;
   let fullText = "";
+  let thinkingBuf = "";
   let sawToolUse = false;
   let stopReason = null;
   let stopReasonSeen = false;
   let usagePromptTokens = null;
   let usageCompletionTokens = null;
+  let usageCacheReadInputTokens = null;
+  let usageCacheCreationInputTokens = null;
   let dataEvents = 0;
   let parsedChunks = 0;
   let emittedChunks = 0;
@@ -148,10 +136,18 @@ async function* openAiChatStreamChunks({ baseUrl, apiKey, model, messages, tools
 
     const u = json && typeof json === "object" && json.usage && typeof json.usage === "object" ? json.usage : null;
     if (u) {
-      const pt = Number(u.prompt_tokens);
-      const ct = Number(u.completion_tokens);
-      if (Number.isFinite(pt)) usagePromptTokens = pt;
-      if (Number.isFinite(ct)) usageCompletionTokens = ct;
+      const pt = normalizeUsageInt(u.prompt_tokens);
+      const ct = normalizeUsageInt(u.completion_tokens);
+      if (pt != null) usagePromptTokens = pt;
+      if (ct != null) usageCompletionTokens = ct;
+
+      const ptd = u.prompt_tokens_details && typeof u.prompt_tokens_details === "object" ? u.prompt_tokens_details : null;
+      if (ptd) {
+        const cached = normalizeUsageInt(ptd.cached_tokens ?? ptd.cache_read_input_tokens ?? ptd.cache_read_tokens);
+        const created = normalizeUsageInt(ptd.cache_creation_tokens ?? ptd.cache_creation_input_tokens);
+        if (cached != null) usageCacheReadInputTokens = cached;
+        if (created != null) usageCacheCreationInputTokens = created;
+      }
     }
 
     const choices = Array.isArray(json?.choices) ? json.choices : [];
@@ -164,6 +160,14 @@ async function* openAiChatStreamChunks({ baseUrl, apiKey, model, messages, tools
         emittedChunks += 1;
         yield makeBackChatChunk({ text, nodes: [rawResponseNode({ id: nodeId, content: text })] });
       }
+
+      const thinking =
+        (typeof delta?.reasoning === "string" && delta.reasoning) ||
+        (typeof delta?.reasoning_content === "string" && delta.reasoning_content) ||
+        (typeof delta?.thinking === "string" && delta.thinking) ||
+        (typeof delta?.thinking_content === "string" && delta.thinking_content) ||
+        "";
+      if (thinking) thinkingBuf += thinking;
 
       const toolCalls = Array.isArray(delta?.tool_calls) ? delta.tool_calls : null;
       if (toolCalls) {
@@ -191,11 +195,18 @@ async function* openAiChatStreamChunks({ baseUrl, apiKey, model, messages, tools
   }
 
   const ordered = Array.from(toolCallsByIndex.entries()).sort((a, b) => a[0] - b[0]).map((x) => x[1]);
-  const hasUsage = usagePromptTokens != null || usageCompletionTokens != null;
+  const hasUsage = usagePromptTokens != null || usageCompletionTokens != null || usageCacheReadInputTokens != null || usageCacheCreationInputTokens != null;
   const hasToolCalls = ordered.some((tc) => normalizeString(tc?.name));
-  if (emittedChunks === 0 && !hasUsage && !hasToolCalls) {
+  const thinkingSummary = normalizeString(thinkingBuf);
+  if (emittedChunks === 0 && !hasUsage && !hasToolCalls && !thinkingSummary) {
     throw new Error(`OpenAI(chat-stream) 未解析到任何上游 SSE 内容（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 OpenAI /chat/completions SSE`);
   }
+
+  if (thinkingSummary) {
+    nodeId += 1;
+    yield makeBackChatChunk({ text: "", nodes: [thinkingNode({ id: nodeId, summary: thinkingSummary })] });
+  }
+
   for (let i = 0; i < ordered.length; i++) {
     const tc = ordered[i];
     const toolName = normalizeString(tc?.name);
@@ -214,7 +225,18 @@ async function* openAiChatStreamChunks({ baseUrl, apiKey, model, messages, tools
   }
   if (hasUsage) {
     nodeId += 1;
-    yield makeBackChatChunk({ text: "", nodes: [tokenUsageNode({ id: nodeId, inputTokens: usagePromptTokens, outputTokens: usageCompletionTokens })] });
+    yield makeBackChatChunk({
+      text: "",
+      nodes: [
+        tokenUsageNode({
+          id: nodeId,
+          inputTokens: usagePromptTokens,
+          outputTokens: usageCompletionTokens,
+          cacheReadInputTokens: usageCacheReadInputTokens,
+          cacheCreationInputTokens: usageCacheCreationInputTokens
+        })
+      ]
+    });
   }
 
   const finalNodes = [];

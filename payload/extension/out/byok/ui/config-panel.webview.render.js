@@ -231,7 +231,9 @@
       lines.push(`<div class="small"><span class="mono">${escapeHtml(p.id)}</span> <span class="badge">${escapeHtml(p.type || "")}</span></div>`);
       if (p.baseUrl) lines.push(`<div class="small">baseUrl: <span class="mono">${escapeHtml(p.baseUrl)}</span></div>`);
       if (p.defaultModel) lines.push(`<div class="small">defaultModel: <span class="mono">${escapeHtml(p.defaultModel)}</span></div>`);
+      lines.push(`<div class="small">auth: ${p.authSet ? `<span class="badge">set</span>` : `<span class="badge">empty</span>`}</div>`);
       lines.push(`<div class="small">apiKey: ${p.apiKeySet ? `<span class="badge">set</span>` : `<span class="badge">empty</span>`}</div>`);
+      lines.push(`<div class="small">headers: <span class="mono">${escapeHtml(String(p.headersCount || 0))}</span></div>`);
       lines.push(`<div class="small">models: <span class="mono">${escapeHtml(String(p.modelsCount || 0))}</span></div>`);
       lines.push(`</div>`);
     }
@@ -332,7 +334,7 @@
     const providersHtml = `
       <div class="card">
         <div class="title">Providers</div>
-        <div class="hint">OpenAI / Anthropic（或兼容 OpenAI Chat Completions 的网关）。models 用于下拉选择与 /get-models 注入。</div>
+        <div class="hint">OpenAI Chat Completions / OpenAI Responses（Codex）/ Anthropic / Google Gemini（AI Studio）。models 用于下拉选择与 /get-models 注入。</div>
         <div class="row" style="margin-bottom:8px;justify-content:space-between;">
           <button class="btn" data-action="addProvider">Add Provider</button>
           <div class="small">Tips: Fetch Models 会把结果写入 UI（pending save）。</div>
@@ -369,7 +371,9 @@
                       <td>
                         <select data-p-idx="${idx}" data-p-key="type">
                           ${optionHtml({ value: "openai_compatible", label: "openai_compatible", selected: type === "openai_compatible" })}
+                          ${optionHtml({ value: "openai_responses", label: "openai_responses", selected: type === "openai_responses" })}
                           ${optionHtml({ value: "anthropic", label: "anthropic", selected: type === "anthropic" })}
+                          ${optionHtml({ value: "gemini_ai_studio", label: "gemini_ai_studio", selected: type === "gemini_ai_studio" })}
                         </select>
                       </td>
                       <td><input type="text" data-p-idx="${idx}" data-p-key="baseUrl" value="${escapeHtml(baseUrl)}" placeholder="https://api.openai.com/v1" /></td>

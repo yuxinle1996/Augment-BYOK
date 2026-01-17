@@ -1,8 +1,8 @@
 {
   "upstream": {
-    "version": "0.754.0",
+    "version": "0.754.1",
     "url": "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/augment/vsextensions/vscode-augment/latest/vspackage",
-    "sha256": "b7656fa9e77bc1665c21fbdd16833e7c8c487bea1f894fc13a2a61121cf4a67b"
+    "sha256": "8c1896d3378c4aa516959bb9e14b74748a255d52053f98188e4131377f8d07d6"
   },
   "interceptorInject": {
     "file": "vendor/augment-interceptor/inject-code.augment-interceptor.v1.2.txt",

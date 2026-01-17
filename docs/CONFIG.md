@@ -54,9 +54,60 @@
   3) 否则使用 `routing.defaultProviderId` + `providers[].defaultModel`
 - `/get-models` 会把 `providers[].models/defaultModel` 注入为 `byok:*`，让 Augment 的 Model Picker 可直接选择；同时必须返回 `feature_flags.enableModelRegistry/modelRegistry/modelInfoRegistry` 等字段，否则主面板模型选择入口会被隐藏。
 
+### 5.1 providers[].type（支持的上游协议）
+
+- `openai_compatible`：OpenAI Chat Completions（`POST /chat/completions`）及兼容网关
+- `openai_responses`：OpenAI Responses（`POST /responses`，Codex/新式 Responses 流式事件）
+  - 可在 `providers[].requestDefaults` 里配置 `reasoning.effort`（例如：`"low" | "medium" | "high"`）
+- `anthropic`：Anthropic Messages（`POST /messages`）
+- `gemini_ai_studio`：Google Gemini（AI Studio API Key / Generative Language API `v1beta`）
+  - `baseUrl` 推荐：`https://generativelanguage.googleapis.com/v1beta`
+  - `model` 推荐用完整名：`models/gemini-1.5-flash`（本实现也接受 `gemini-1.5-flash` 并自动补前缀）
+
 ## 6) VS Code 命令（运维入口）
 
 - `BYOK: Open Config Panel`：配置面板（Save/Reset/Export/Import/Enable/Disable）。
 - `BYOK: Reload Config`：从 `globalState` 重新加载（便于排查同步/异常）。
 - `BYOK: Disable (Rollback)`：运行时回滚到官方链路（不改配置）。
 - `BYOK: Clear History Summary Cache`：清空历史摘要缓存（不会影响面板显示的完整历史；仅影响后台滚动摘要复用）。
+
+## 7) 工具调用（严格对接 Augment 协议）
+
+### 7.1 Augment 侧（本扩展输入/输出的“单一真相”）
+
+- **工具请求（tool use）**：来自模型输出的 `response_nodes`：
+  - `RESPONSE_NODE_TOOL_USE_START`（可选，仅用于 UI/调度提示）
+  - `RESPONSE_NODE_TOOL_USE`（实际工具调用，包含 `tool_use_id/tool_name/input_json`）
+- **工具结果（tool result）**：由客户端/Agent 执行工具后，在下一次请求里回填到 `request_nodes`：
+  - `REQUEST_NODE_TOOL_RESULT`（包含 `tool_use_id` + `content`/`content_nodes` + `is_error`）
+
+这意味着：**任何一次模型发出的 tool_use，都必须在后续请求中出现同一个 `tool_use_id` 的 tool_result**，否则对话会停在“等待工具结果”的中间状态。
+
+### 7.2 上游 Provider 的硬约束（否则会 400/422）
+
+- **OpenAI Chat Completions（`openai_compatible`）**
+  - `messages` 中一旦出现 `role:"assistant"` + `tool_calls:[{id:"call_x",...}]`
+  - 后续必须出现 `role:"tool"` + `tool_call_id:"call_x"` 的工具结果消息（每个 id 都要回）
+- **OpenAI Responses（`openai_responses`）**
+  - `input` 中一旦出现 `type:"function_call"` + `call_id:"call_x"`
+  - 后续必须出现 `type:"function_call_output"` + `call_id:"call_x"`（每个 call_id 都要回）
+- **Anthropic**
+  - assistant `content` 中出现 `tool_use`（`id`）
+  - 后续必须出现 user `content` 中的 `tool_result`（`tool_use_id` 匹配）
+- **Gemini（AI Studio / `gemini_ai_studio`）**
+  - model `parts` 中出现 `functionCall`（`name`）
+  - 后续必须出现 user `parts` 中的 `functionResponse`（同名 `name` 对应）
+
+### 7.3 BYOK 的容错策略（避免“硬失败”）
+
+为避免因工具执行失败/网络错误/历史裁剪导致的“缺 tool_result → 上游直接 400/422”，BYOK 在构造上下文时会做一次配对修复（按 provider 协议分别处理）：
+
+- 缺失 `tool_result`：自动注入一个“错误型 tool_result”（内容为 JSON，标记 `tool_result_missing`），让模型能继续对话并自行降级。
+- 出现孤儿 `tool_result`（历史里找不到对应 tool_call）：转换成 `role:"user"` 的纯文本提示，避免 OpenAI 拒绝请求。
+
+这不是“隐藏错误”，而是把“协议级 hard error”降级成“模型可见的软错误”，便于继续工作与排查。
+
+### 7.4 Provider 鉴权补充（多运营商兼容）
+
+`providers[].apiKey` 现在允许为空：只要你在 `providers[].headers` 里提供了有效鉴权头（例如 `authorization`/`api-key`/`x-api-key`/`x-goog-api-key` 等）。  
+如果 `apiKey` 与 `headers` 都为空，请求会在本地 fail-fast。

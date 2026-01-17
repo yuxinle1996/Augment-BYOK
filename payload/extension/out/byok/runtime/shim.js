@@ -8,10 +8,24 @@ const { decideRoute } = require("../core/router");
 const { normalizeEndpoint, normalizeString, normalizeRawToken, safeTransform, emptyAsyncGenerator } = require("../infra/util");
 const { ensureModelRegistryFeatureFlags } = require("../core/model-registry");
 const { openAiCompleteText, openAiStreamTextDeltas, openAiChatStreamChunks } = require("../providers/openai");
+const { openAiResponsesCompleteText, openAiResponsesStreamTextDeltas, openAiResponsesChatStreamChunks } = require("../providers/openai-responses");
 const { anthropicCompleteText, anthropicStreamTextDeltas, anthropicChatStreamChunks } = require("../providers/anthropic");
+const { geminiCompleteText, geminiStreamTextDeltas, geminiChatStreamChunks } = require("../providers/gemini");
 const { joinBaseUrl, safeFetch, readTextLimit } = require("../providers/http");
 const { getOfficialConnection } = require("../config/official");
-const { normalizeAugmentChatRequest, buildSystemPrompt, convertOpenAiTools, convertAnthropicTools, buildToolMetaByName, buildOpenAiMessages, buildAnthropicMessages } = require("../core/augment-chat");
+const {
+  normalizeAugmentChatRequest,
+  buildSystemPrompt,
+  convertOpenAiTools,
+  convertOpenAiResponsesTools,
+  convertAnthropicTools,
+  convertGeminiTools,
+  buildToolMetaByName,
+  buildOpenAiMessages,
+  buildOpenAiResponsesInput,
+  buildAnthropicMessages,
+  buildGeminiContents
+} = require("../core/augment-chat");
 const augmentChatShared = require("../core/augment-chat.shared");
 const { maybeSummarizeAndCompactAugmentChatRequest, deleteHistorySummaryCache } = require("../core/augment-history-summary-auto");
 const { REQUEST_NODE_TEXT, REQUEST_NODE_TOOL_RESULT, STOP_REASON_END_TURN, makeBackChatChunk } = require("../core/augment-protocol");
@@ -54,9 +68,7 @@ async function maybeDeleteHistorySummaryCacheForEndpoint(ep, body) {
 
 function resolveProviderApiKey(provider, label) {
   if (!provider || typeof provider !== "object") throw new Error(`${label} provider 无效`);
-  const key = normalizeRawToken(provider.apiKey);
-  if (key) return key;
-  throw new Error(`${label} 未配置 api_key`);
+  return normalizeRawToken(provider.apiKey);
 }
 
 function providerLabel(provider) {
@@ -72,6 +84,7 @@ function providerRequestContext(provider) {
   const apiKey = resolveProviderApiKey(provider, providerLabel(provider));
   const extraHeaders = provider.headers && typeof provider.headers === "object" ? provider.headers : {};
   const requestDefaults = provider.requestDefaults && typeof provider.requestDefaults === "object" ? provider.requestDefaults : {};
+  if (!apiKey && Object.keys(extraHeaders).length === 0) throw new Error(`${providerLabel(provider)} 未配置 api_key（且 headers 为空）`);
   return { type, baseUrl, apiKey, extraHeaders, requestDefaults };
 }
 
@@ -88,6 +101,34 @@ function asAnthropicMessages(system, messages) {
     .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content)
     .map((m) => ({ role: m.role, content: m.content }));
   return { system: sys, messages: out };
+}
+
+function asGeminiContents(system, messages) {
+  const sys = normalizeString(system);
+  const ms = Array.isArray(messages) ? messages : [];
+  const contents = [];
+  for (const m of ms) {
+    if (!m || typeof m !== "object") continue;
+    const role = m.role === "assistant" ? "model" : m.role === "user" ? "user" : "";
+    const content = typeof m.content === "string" ? m.content : "";
+    if (!role || !content) continue;
+    contents.push({ role, parts: [{ text: content }] });
+  }
+  return { systemInstruction: sys, contents };
+}
+
+function asOpenAiResponsesInput(system, messages) {
+  const sys = normalizeString(system);
+  const ms = Array.isArray(messages) ? messages : [];
+  const input = [];
+  for (const m of ms) {
+    if (!m || typeof m !== "object") continue;
+    const role = m.role === "assistant" ? "assistant" : m.role === "user" ? "user" : "";
+    const content = typeof m.content === "string" ? m.content : "";
+    if (!role || !content) continue;
+    input.push({ type: "message", role, content });
+  }
+  return { instructions: sys, input };
 }
 
 function isTelemetryDisabled(cfg, ep) {
@@ -319,6 +360,14 @@ async function byokCompleteText({ provider, model, system, messages, timeoutMs, 
     const { system: sys, messages: msgs } = asAnthropicMessages(system, messages);
     return await anthropicCompleteText({ baseUrl, apiKey, model, system: sys, messages: msgs, timeoutMs, abortSignal, extraHeaders, requestDefaults });
   }
+  if (type === "openai_responses") {
+    const { instructions, input } = asOpenAiResponsesInput(system, messages);
+    return await openAiResponsesCompleteText({ baseUrl, apiKey, model, instructions, input, timeoutMs, abortSignal, extraHeaders, requestDefaults });
+  }
+  if (type === "gemini_ai_studio") {
+    const { systemInstruction, contents } = asGeminiContents(system, messages);
+    return await geminiCompleteText({ baseUrl, apiKey, model, systemInstruction, contents, timeoutMs, abortSignal, extraHeaders, requestDefaults });
+  }
   throw new Error(`未知 provider.type: ${type}`);
 }
 
@@ -341,6 +390,16 @@ async function* byokStreamText({ provider, model, system, messages, timeoutMs, a
   if (type === "anthropic") {
     const { system: sys, messages: msgs } = asAnthropicMessages(system, messages);
     yield* anthropicStreamTextDeltas({ baseUrl, apiKey, model, system: sys, messages: msgs, timeoutMs, abortSignal, extraHeaders, requestDefaults });
+    return;
+  }
+  if (type === "openai_responses") {
+    const { instructions, input } = asOpenAiResponsesInput(system, messages);
+    yield* openAiResponsesStreamTextDeltas({ baseUrl, apiKey, model, instructions, input, timeoutMs, abortSignal, extraHeaders, requestDefaults });
+    return;
+  }
+  if (type === "gemini_ai_studio") {
+    const { systemInstruction, contents } = asGeminiContents(system, messages);
+    yield* geminiStreamTextDeltas({ baseUrl, apiKey, model, systemInstruction, contents, timeoutMs, abortSignal, extraHeaders, requestDefaults });
     return;
   }
   throw new Error(`未知 provider.type: ${type}`);
@@ -374,6 +433,16 @@ async function* byokChatStream({ cfg, provider, model, requestedModel, body, tim
   }
   if (type === "anthropic") {
     yield* anthropicChatStreamChunks({ baseUrl, apiKey, model, system: buildSystemPrompt(req), messages: buildAnthropicMessages(req), tools: convertAnthropicTools(req.tool_definitions), timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart });
+    return;
+  }
+  if (type === "openai_responses") {
+    const { instructions, input } = buildOpenAiResponsesInput(req);
+    yield* openAiResponsesChatStreamChunks({ baseUrl, apiKey, model, instructions, input, tools: convertOpenAiResponsesTools(req.tool_definitions), timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart });
+    return;
+  }
+  if (type === "gemini_ai_studio") {
+    const { systemInstruction, contents } = buildGeminiContents(req);
+    yield* geminiChatStreamChunks({ baseUrl, apiKey, model, systemInstruction, contents, tools: convertGeminiTools(req.tool_definitions), timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart });
     return;
   }
   throw new Error(`未知 provider.type: ${type}`);

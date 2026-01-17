@@ -2,8 +2,9 @@
 
 const { joinBaseUrl, safeFetch, readTextLimit } = require("./http");
 const { parseSse } = require("./sse");
-const { normalizeString, requireString } = require("../infra/util");
+const { normalizeString, requireString, normalizeRawToken } = require("../infra/util");
 const { withJsonContentType, anthropicAuthHeaders } = require("./headers");
+const { normalizeUsageInt, makeToolMetaGetter, assertSseResponse } = require("./provider-util");
 const {
   STOP_REASON_END_TURN,
   STOP_REASON_TOOL_USE_REQUESTED,
@@ -25,7 +26,9 @@ function pickMaxTokens(requestDefaults) {
 
 function buildAnthropicRequest({ baseUrl, apiKey, model, system, messages, tools, extraHeaders, requestDefaults, stream }) {
   const url = joinBaseUrl(requireString(baseUrl, "Anthropic baseUrl"), "messages");
-  const key = requireString(apiKey, "Anthropic apiKey");
+  const key = normalizeRawToken(apiKey);
+  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
+  if (!key && Object.keys(extra).length === 0) throw new Error("Anthropic apiKey 未配置（且 headers 为空）");
   const m = requireString(model, "Anthropic model");
   if (!Array.isArray(messages) || !messages.length) throw new Error("Anthropic messages 为空");
 
@@ -81,11 +84,7 @@ async function* anthropicStreamTextDeltas({ baseUrl, apiKey, model, system, mess
   );
 
   if (!resp.ok) throw new Error(`Anthropic(stream) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
-  const contentType = normalizeString(resp.headers?.get?.("content-type")).toLowerCase();
-  if (!contentType.includes("text/event-stream")) {
-    const preview = await readTextLimit(resp, 500);
-    throw new Error(`Anthropic(stream) 响应不是 SSE（content-type=${contentType || "unknown"}）；请确认 baseUrl 指向 Anthropic /messages SSE；body: ${preview}`.trim());
-  }
+  await assertSseResponse(resp, { label: "Anthropic(stream)", expectedHint: "请确认 baseUrl 指向 Anthropic /messages SSE" });
   let dataEvents = 0;
   let parsedChunks = 0;
   let emitted = 0;
@@ -105,23 +104,13 @@ async function* anthropicStreamTextDeltas({ baseUrl, apiKey, model, system, mess
   if (emitted === 0) throw new Error(`Anthropic(stream) 未解析到任何 SSE delta（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 Anthropic SSE`.trim());
 }
 
-function normalizeUsageInt(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
 async function* anthropicChatStreamChunks({ baseUrl, apiKey, model, system, messages, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart }) {
   const { url, headers, body } = buildAnthropicRequest({ baseUrl, apiKey, model, system, messages, tools, extraHeaders, requestDefaults, stream: true });
   const resp = await safeFetch(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "Anthropic(chat-stream)" });
   if (!resp.ok) throw new Error(`Anthropic(chat-stream) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
-  const contentType = normalizeString(resp.headers?.get?.("content-type")).toLowerCase();
-  if (!contentType.includes("text/event-stream")) {
-    const preview = await readTextLimit(resp, 500);
-    throw new Error(`Anthropic(chat-stream) 响应不是 SSE（content-type=${contentType || "unknown"}）；请确认 baseUrl 指向 Anthropic /messages SSE；body: ${preview}`.trim());
-  }
+  await assertSseResponse(resp, { label: "Anthropic(chat-stream)", expectedHint: "请确认 baseUrl 指向 Anthropic /messages SSE" });
 
-  const metaMap = toolMetaByName instanceof Map ? toolMetaByName : new Map();
-  const getToolMeta = (toolName) => metaMap.get(toolName) || {};
+  const getToolMeta = makeToolMetaGetter(toolMetaByName);
 
   let nodeId = 0;
   let fullText = "";

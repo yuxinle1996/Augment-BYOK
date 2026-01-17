@@ -1,7 +1,7 @@
 "use strict";
 
 const { debug } = require("../infra/log");
-const { normalizeString } = require("../infra/util");
+const { normalizeString, normalizeRawToken } = require("../infra/util");
 const { state } = require("../config/state");
 const { openAiCompleteText } = require("../providers/openai");
 const { anthropicCompleteText } = require("../providers/anthropic");
@@ -289,10 +289,11 @@ async function runSummaryModelOnce({ provider, model, prompt, chatHistory, maxTo
   const p = provider && typeof provider === "object" ? provider : null;
   const type = normalizeString(p?.type);
   const baseUrl = normalizeString(p?.baseUrl);
-  const apiKey = normalizeString(p?.apiKey);
+  const apiKey = normalizeRawToken(p?.apiKey);
   const extraHeaders = p?.headers && typeof p.headers === "object" && !Array.isArray(p.headers) ? p.headers : {};
   const requestDefaults = normalizeProviderRequestDefaults(p, maxTokens);
-  if (!type || !baseUrl || !apiKey || !normalizeString(model)) throw new Error("historySummary provider/model 未配置");
+  if (!type || !baseUrl || !normalizeString(model)) throw new Error("historySummary provider/model 未配置");
+  if (!apiKey && Object.keys(extraHeaders).length === 0) throw new Error("historySummary provider 未配置 api_key（且 headers 为空）");
   if (!normalizeString(prompt) || !Array.isArray(chatHistory) || !chatHistory.length) throw new Error("historySummary prompt/chatHistory 为空");
 
   const augmentReq = {

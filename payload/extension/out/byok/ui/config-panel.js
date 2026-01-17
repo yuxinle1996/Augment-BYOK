@@ -13,6 +13,12 @@ function summarizeRuntime({ cfgMgr, state }) {
   const off = cfg?.official && typeof cfg.official === "object" ? cfg.official : {};
   const providers = Array.isArray(cfg?.providers) ? cfg.providers : [];
 
+  const hasAuthHeader = (headers) => {
+    const h = headers && typeof headers === "object" && !Array.isArray(headers) ? headers : {};
+    const keys = Object.keys(h).map((k) => String(k || "").trim().toLowerCase());
+    return keys.some((k) => k === "authorization" || k === "x-api-key" || k === "api-key" || k === "x-goog-api-key");
+  };
+
   return {
     runtimeEnabled: Boolean(state?.runtimeEnabled),
     byokEnabled: cfg?.enabled === true,
@@ -27,7 +33,9 @@ function summarizeRuntime({ cfgMgr, state }) {
       baseUrl: normalizeString(p?.baseUrl),
       defaultModel: normalizeString(p?.defaultModel),
       modelsCount: Array.isArray(p?.models) ? p.models.filter((m) => normalizeString(m)).length : 0,
-      apiKeySet: Boolean(normalizeString(p?.apiKey))
+      apiKeySet: Boolean(normalizeString(p?.apiKey)),
+      headersCount: p?.headers && typeof p.headers === "object" && !Array.isArray(p.headers) ? Object.keys(p.headers).length : 0,
+      authSet: Boolean(normalizeString(p?.apiKey)) || hasAuthHeader(p?.headers)
     }))
   };
 }

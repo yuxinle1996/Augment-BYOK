@@ -1,0 +1,309 @@
+"use strict";
+
+const { joinBaseUrl, safeFetch, readTextLimit } = require("./http");
+const { parseSse } = require("./sse");
+const { normalizeString, requireString, normalizeRawToken } = require("../infra/util");
+const { withJsonContentType, openAiAuthHeaders } = require("./headers");
+const { normalizeUsageInt, makeToolMetaGetter, assertSseResponse } = require("./provider-util");
+const {
+  STOP_REASON_END_TURN,
+  STOP_REASON_MAX_TOKENS,
+  STOP_REASON_TOOL_USE_REQUESTED,
+  rawResponseNode,
+  toolUseStartNode,
+  toolUseNode,
+  thinkingNode,
+  tokenUsageNode,
+  mainTextFinishedNode,
+  makeBackChatChunk
+} = require("../core/augment-protocol");
+
+function buildOpenAiResponsesRequest({ baseUrl, apiKey, model, instructions, input, tools, extraHeaders, requestDefaults, stream }) {
+  const url = joinBaseUrl(requireString(baseUrl, "OpenAI baseUrl"), "responses");
+  const key = normalizeRawToken(apiKey);
+  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
+  if (!key && Object.keys(extra).length === 0) throw new Error("OpenAI apiKey 未配置（且 headers 为空）");
+
+  const m = requireString(model, "OpenAI model");
+  const body = { ...(requestDefaults && typeof requestDefaults === "object" ? requestDefaults : null), model: m, input, stream: Boolean(stream) };
+  const ins = normalizeString(instructions);
+  if (ins) body.instructions = ins.trim();
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    if (body.tool_choice == null) body.tool_choice = "auto";
+  }
+
+  const headers = withJsonContentType(openAiAuthHeaders(key, extraHeaders));
+  if (stream) headers.accept = "text/event-stream";
+  return { url, headers, body };
+}
+
+async function openAiResponsesCompleteText({ baseUrl, apiKey, model, instructions, input, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
+  const { url, headers, body } = buildOpenAiResponsesRequest({ baseUrl, apiKey, model, instructions, input, tools: [], extraHeaders, requestDefaults, stream: false });
+  const resp = await safeFetch(
+    url,
+    { method: "POST", headers, body: JSON.stringify(body) },
+    { timeoutMs, abortSignal, label: "OpenAI(responses)" }
+  );
+  if (!resp.ok) throw new Error(`OpenAI(responses) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
+  const json = await resp.json().catch(() => null);
+  const text = normalizeString(json?.output_text ?? json?.outputText);
+  if (!text) throw new Error("OpenAI(responses) 响应缺少 output_text");
+  return text;
+}
+
+async function* openAiResponsesStreamTextDeltas({ baseUrl, apiKey, model, instructions, input, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
+  const { url, headers, body } = buildOpenAiResponsesRequest({ baseUrl, apiKey, model, instructions, input, tools: [], extraHeaders, requestDefaults, stream: true });
+  const resp = await safeFetch(
+    url,
+    { method: "POST", headers, body: JSON.stringify(body) },
+    { timeoutMs, abortSignal, label: "OpenAI(responses-stream)" }
+  );
+
+  if (!resp.ok) throw new Error(`OpenAI(responses-stream) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
+  await assertSseResponse(resp, { label: "OpenAI(responses-stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /responses SSE" });
+
+  let dataEvents = 0;
+  let parsedChunks = 0;
+  let emitted = 0;
+  for await (const ev of parseSse(resp)) {
+    const data = normalizeString(ev?.data);
+    if (!data) continue;
+    dataEvents += 1;
+    if (data === "[DONE]") break;
+    let json;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    parsedChunks += 1;
+    const eventType = normalizeString(json?.type) || normalizeString(ev?.event);
+    if (eventType === "response.output_text.delta" && typeof json?.delta === "string" && json.delta) {
+      emitted += 1;
+      yield json.delta;
+    } else if (eventType === "response.error") {
+      const msg = normalizeString(json?.error?.message) || normalizeString(json?.message) || "upstream error event";
+      throw new Error(`OpenAI(responses-stream) error event: ${msg}`.trim());
+    }
+  }
+  if (emitted === 0) throw new Error(`OpenAI(responses-stream) 未解析到任何 SSE delta（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 OpenAI SSE`.trim());
+}
+
+function extractToolCallsFromResponseOutput(output) {
+  const list = Array.isArray(output) ? output : [];
+  const out = [];
+  for (const it of list) {
+    if (!it || typeof it !== "object") continue;
+    if (it.type !== "function_call") continue;
+    const call_id = normalizeString(it.call_id);
+    const name = normalizeString(it.name);
+    const args = typeof it.arguments === "string" ? it.arguments : "";
+    if (!call_id || !name) continue;
+    out.push({ call_id, name, arguments: normalizeString(args) || "{}" });
+  }
+  return out;
+}
+
+function extractReasoningSummaryFromResponseOutput(output) {
+  const list = Array.isArray(output) ? output : [];
+  const parts = [];
+  for (const it of list) {
+    if (!it || typeof it !== "object") continue;
+    if (it.type !== "reasoning") continue;
+    const summary = Array.isArray(it.summary) ? it.summary : [];
+    for (const s of summary) {
+      if (!s || typeof s !== "object") continue;
+      if (s.type !== "summary_text") continue;
+      const text = normalizeString(s.text);
+      if (text) parts.push(text);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+async function* openAiResponsesChatStreamChunks({ baseUrl, apiKey, model, instructions, input, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart }) {
+  const getToolMeta = makeToolMetaGetter(toolMetaByName);
+
+  const { url, headers, body } = buildOpenAiResponsesRequest({ baseUrl, apiKey, model, instructions, input, tools, extraHeaders, requestDefaults, stream: true });
+  const resp = await safeFetch(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(responses-chat-stream)" });
+
+  if (!resp.ok) throw new Error(`OpenAI(responses-chat-stream) ${resp.status}: ${await readTextLimit(resp, 500)}`.trim());
+  await assertSseResponse(resp, { label: "OpenAI(responses-chat-stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /responses SSE" });
+
+  let nodeId = 0;
+  let fullText = "";
+  let sawToolUse = false;
+  let sawMaxTokens = false;
+  let usageInputTokens = null;
+  let usageOutputTokens = null;
+  let usageCacheReadInputTokens = null;
+  let thinkingBuf = "";
+  let dataEvents = 0;
+  let parsedChunks = 0;
+  let emittedChunks = 0;
+  let finalResponse = null;
+  const toolCallsByOutputIndex = new Map(); // output_index -> {call_id,name,arguments}
+
+  for await (const ev of parseSse(resp)) {
+    const data = normalizeString(ev?.data);
+    if (!data) continue;
+    dataEvents += 1;
+    if (data === "[DONE]") break;
+    let json;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    parsedChunks += 1;
+
+    const eventType = normalizeString(json?.type) || normalizeString(ev?.event);
+    if (!eventType) continue;
+
+    if (eventType === "response.output_item.added") {
+      const item = json?.item && typeof json.item === "object" ? json.item : null;
+      const outputIndex = Number(json?.output_index);
+      if (item && item.type === "function_call" && Number.isFinite(outputIndex) && outputIndex >= 0) {
+        const call_id = normalizeString(item.call_id);
+        const name = normalizeString(item.name);
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        if (call_id && name) toolCallsByOutputIndex.set(Math.floor(outputIndex), { call_id, name, arguments: normalizeString(args) || "" });
+      }
+      continue;
+    }
+
+    if (eventType === "response.function_call_arguments.delta") {
+      const outputIndex = Number(json?.output_index);
+      const delta = typeof json?.delta === "string" ? json.delta : "";
+      if (delta && Number.isFinite(outputIndex)) {
+        const rec = toolCallsByOutputIndex.get(Math.floor(outputIndex));
+        if (rec) rec.arguments += delta;
+      }
+      continue;
+    }
+
+    if (eventType === "response.function_call_arguments.done") {
+      const outputIndex = Number(json?.output_index);
+      const args = typeof json?.arguments === "string" ? json.arguments : "";
+      if (Number.isFinite(outputIndex) && args) {
+        const rec = toolCallsByOutputIndex.get(Math.floor(outputIndex));
+        if (rec) rec.arguments = args;
+      }
+      continue;
+    }
+
+    if (eventType === "response.output_text.delta" && typeof json?.delta === "string" && json.delta) {
+      const t = json.delta;
+      fullText += t;
+      nodeId += 1;
+      emittedChunks += 1;
+      yield makeBackChatChunk({ text: t, nodes: [rawResponseNode({ id: nodeId, content: t })] });
+      continue;
+    }
+
+    if (eventType === "response.reasoning_summary_part.added" || eventType === "response.reasoning_summary_text.done") {
+      const partText = normalizeString(json?.part?.text ?? json?.text);
+      if (partText) thinkingBuf += (thinkingBuf ? "\n" : "") + partText;
+      continue;
+    }
+
+    if (eventType === "response.reasoning_text.delta" && typeof json?.delta === "string" && json.delta) {
+      thinkingBuf += json.delta;
+      continue;
+    }
+
+    if (eventType === "response.incomplete") {
+      sawMaxTokens = true;
+      continue;
+    }
+
+    if (eventType === "response.completed" && json?.response && typeof json.response === "object") {
+      finalResponse = json.response;
+      const usage = json.response?.usage && typeof json.response.usage === "object" ? json.response.usage : null;
+      if (usage) {
+        const it = normalizeUsageInt(usage.input_tokens);
+        const ot = normalizeUsageInt(usage.output_tokens);
+        const cached = normalizeUsageInt(usage?.input_tokens_details?.cached_tokens);
+        if (it != null) usageInputTokens = it;
+        if (ot != null) usageOutputTokens = ot;
+        if (cached != null) usageCacheReadInputTokens = cached;
+      }
+      continue;
+    }
+
+    if (eventType === "response.error") {
+      const msg = normalizeString(json?.error?.message) || normalizeString(json?.message) || "upstream error event";
+      yield makeBackChatChunk({ text: `❌ 上游返回 error event: ${msg}`.trim(), stop_reason: STOP_REASON_END_TURN });
+      return;
+    }
+  }
+
+  let toolCalls = [];
+  let reasoningSummary = "";
+  if (finalResponse && typeof finalResponse === "object") {
+    const out = Array.isArray(finalResponse.output) ? finalResponse.output : [];
+    toolCalls = extractToolCallsFromResponseOutput(out);
+    reasoningSummary = extractReasoningSummaryFromResponseOutput(out);
+    const u = finalResponse?.usage && typeof finalResponse.usage === "object" ? finalResponse.usage : null;
+    if (u) {
+      const it = normalizeUsageInt(u.input_tokens);
+      const ot = normalizeUsageInt(u.output_tokens);
+      const cached = normalizeUsageInt(u?.input_tokens_details?.cached_tokens);
+      if (it != null) usageInputTokens = it;
+      if (ot != null) usageOutputTokens = ot;
+      if (cached != null) usageCacheReadInputTokens = cached;
+    }
+    if (!fullText) fullText = normalizeString(finalResponse.output_text);
+  } else {
+    toolCalls = Array.from(toolCallsByOutputIndex.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map((x) => x[1])
+      .filter((tc) => tc && typeof tc === "object");
+  }
+
+  if (reasoningSummary) thinkingBuf = reasoningSummary;
+
+  if (thinkingBuf) {
+    nodeId += 1;
+    yield makeBackChatChunk({ text: "", nodes: [thinkingNode({ id: nodeId, summary: thinkingBuf })] });
+  }
+
+  for (const tc of toolCalls) {
+    const toolName = normalizeString(tc?.name);
+    if (!toolName) continue;
+    let toolUseId = normalizeString(tc?.call_id);
+    if (!toolUseId) toolUseId = `call_${nodeId + 1}`;
+    const inputJson = normalizeString(tc?.arguments) || "{}";
+    const meta = getToolMeta(toolName);
+    sawToolUse = true;
+    if (supportToolUseStart === true) {
+      nodeId += 1;
+      yield makeBackChatChunk({ text: "", nodes: [toolUseStartNode({ id: nodeId, toolUseId, toolName, inputJson, mcpServerName: meta.mcpServerName, mcpToolName: meta.mcpToolName })] });
+    }
+    nodeId += 1;
+    yield makeBackChatChunk({ text: "", nodes: [toolUseNode({ id: nodeId, toolUseId, toolName, inputJson, mcpServerName: meta.mcpServerName, mcpToolName: meta.mcpToolName })] });
+  }
+
+  const hasUsage = usageInputTokens != null || usageOutputTokens != null || usageCacheReadInputTokens != null;
+  if (hasUsage) {
+    nodeId += 1;
+    yield makeBackChatChunk({ text: "", nodes: [tokenUsageNode({ id: nodeId, inputTokens: usageInputTokens, outputTokens: usageOutputTokens, cacheReadInputTokens: usageCacheReadInputTokens })] });
+  }
+
+  const finalNodes = [];
+  if (fullText) {
+    nodeId += 1;
+    finalNodes.push(mainTextFinishedNode({ id: nodeId, content: fullText }));
+  }
+
+  const stop_reason = sawMaxTokens ? STOP_REASON_MAX_TOKENS : sawToolUse ? STOP_REASON_TOOL_USE_REQUESTED : STOP_REASON_END_TURN;
+  yield makeBackChatChunk({ text: "", nodes: finalNodes, stop_reason });
+
+  const emittedAny = emittedChunks > 0 || hasUsage || toolCalls.length > 0 || Boolean(thinkingBuf);
+  if (!emittedAny) {
+    throw new Error(`OpenAI(responses-chat-stream) 未解析到任何上游 SSE 内容（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 OpenAI /responses SSE`);
+  }
+}
+
+module.exports = { openAiResponsesCompleteText, openAiResponsesStreamTextDeltas, openAiResponsesChatStreamChunks };
