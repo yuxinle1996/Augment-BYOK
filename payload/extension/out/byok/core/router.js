@@ -29,7 +29,12 @@ function decideRoute({ cfg, endpoint, body, runtimeEnabled }) {
 
   const rule = getRule(cfg, ep);
   const requestedModel = pickRequestedModel(body);
-  const parsed = parseByokModelId(requestedModel, { strict: true });
+  let parsed = null;
+  try {
+    parsed = parseByokModelId(requestedModel, { strict: true });
+  } catch {
+    parsed = null;
+  }
   const mode = normalizeString(rule?.mode) || "official";
   if (mode === "disabled") return { mode, endpoint: ep, reason: "rule" };
   if (mode === "official" && !parsed) return { mode, endpoint: ep, reason: "rule" };

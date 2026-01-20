@@ -4,37 +4,22 @@ const { joinBaseUrl } = require("./http");
 const { parseSse } = require("./sse");
 const { normalizeString, requireString, normalizeRawToken, stripByokInternalKeys } = require("../infra/util");
 const { withJsonContentType } = require("./headers");
-const { normalizeUsageInt, makeToolMetaGetter, assertSseResponse } = require("./provider-util");
+const { makeToolMetaGetter, assertSseResponse } = require("./provider-util");
 const { fetchOkWithRetry, extractErrorMessageFromJson } = require("./request-util");
+const { rawResponseNode, makeBackChatChunk } = require("../core/augment-protocol");
+const { buildToolUseChunks, buildTokenUsageChunk, buildFinalChatChunk } = require("./chat-chunks-util");
 const {
-  STOP_REASON_END_TURN,
-  STOP_REASON_MAX_TOKENS,
-  STOP_REASON_TOOL_USE_REQUESTED,
-  STOP_REASON_SAFETY,
-  STOP_REASON_RECITATION,
-  STOP_REASON_MALFORMED_FUNCTION_CALL,
-  rawResponseNode,
-  toolUseStartNode,
-  toolUseNode,
-  mainTextFinishedNode,
-  tokenUsageNode,
-  makeBackChatChunk
-} = require("../core/augment-protocol");
+  sanitizeToolHint,
+  normalizeFunctionCallArgsToJsonString,
+  extractGeminiUsageTokens,
+  extractGeminiStopReasonFromCandidate,
+  emitGeminiChatJsonAsAugmentChunks
+} = require("./gemini-json-util");
 
 function normalizeGeminiModel(model) {
   const m = requireString(model, "Gemini model");
   if (m.includes("/")) return m;
   return `models/${m}`;
-}
-
-function mapGeminiFinishReasonToAugment(reason) {
-  const r = normalizeString(reason).trim().toUpperCase();
-  if (r === "STOP") return STOP_REASON_END_TURN;
-  if (r === "MAX_TOKENS") return STOP_REASON_MAX_TOKENS;
-  if (r === "SAFETY") return STOP_REASON_SAFETY;
-  if (r === "RECITATION") return STOP_REASON_RECITATION;
-  if (r === "MALFORMED_FUNCTION_CALL") return STOP_REASON_MALFORMED_FUNCTION_CALL;
-  return STOP_REASON_END_TURN;
 }
 
 function buildGeminiRequest({ baseUrl, apiKey, model, systemInstruction, contents, tools, extraHeaders, requestDefaults, stream }) {
@@ -87,6 +72,20 @@ async function geminiCompleteText({ baseUrl, apiKey, model, systemInstruction, c
 async function* geminiStreamTextDeltas({ baseUrl, apiKey, model, systemInstruction, contents, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
   const { url, headers, body } = buildGeminiRequest({ baseUrl, apiKey, model, systemInstruction, contents, tools: [], extraHeaders, requestDefaults, stream: true });
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "Gemini(stream)" });
+  const contentType = normalizeString(resp?.headers?.get?.("content-type")).toLowerCase();
+  if (contentType.includes("json")) {
+    const json = await resp.json().catch(() => null);
+    if (json && typeof json === "object" && (json.error || json.message)) {
+      const msg = normalizeString(extractErrorMessageFromJson(json)) || "upstream error";
+      throw new Error(`Gemini(stream) upstream error: ${msg}`.trim());
+    }
+    const text = extractGeminiTextFromResponse(json);
+    if (text) {
+      yield text;
+      return;
+    }
+    throw new Error(`Gemini(stream) JSON 响应缺少 candidates[0].content.parts[].text（content-type=${contentType || "unknown"}）`.trim());
+  }
   await assertSseResponse(resp, { label: "Gemini(stream)", expectedHint: "请确认 baseUrl 指向 Google Generative Language API" });
 
   let dataEvents = 0;
@@ -129,28 +128,17 @@ async function* geminiStreamTextDeltas({ baseUrl, apiKey, model, systemInstructi
   if (emitted === 0) throw new Error(`Gemini(stream) 未解析到任何 SSE delta（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 Gemini SSE`.trim());
 }
 
-function sanitizeToolHint(toolName) {
-  const t = normalizeString(toolName);
-  return t.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 48) || "tool";
-}
-
-function normalizeFunctionCallArgsToJsonString(args) {
-  if (typeof args === "string") return normalizeString(args) || "{}";
-  if (args && typeof args === "object") {
-    try {
-      return JSON.stringify(args);
-    } catch {
-      return "{}";
-    }
-  }
-  return "{}";
-}
-
 async function* geminiChatStreamChunks({ baseUrl, apiKey, model, systemInstruction, contents, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart }) {
   const getToolMeta = makeToolMetaGetter(toolMetaByName);
 
   const { url, headers, body } = buildGeminiRequest({ baseUrl, apiKey, model, systemInstruction, contents, tools, extraHeaders, requestDefaults, stream: true });
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "Gemini(chat-stream)" });
+  const contentType = normalizeString(resp?.headers?.get?.("content-type")).toLowerCase();
+  if (contentType.includes("json")) {
+    const json = await resp.json().catch(() => null);
+    yield* emitGeminiChatJsonAsAugmentChunks(json, { toolMetaByName, supportToolUseStart });
+    return;
+  }
   await assertSseResponse(resp, { label: "Gemini(chat-stream)", expectedHint: "请确认 baseUrl 指向 Gemini /streamGenerateContent SSE" });
 
   let nodeId = 0;
@@ -184,22 +172,17 @@ async function* geminiChatStreamChunks({ baseUrl, apiKey, model, systemInstructi
       throw new Error(`Gemini(chat-stream) upstream error: ${msg}`.trim());
     }
 
-    const um = json?.usageMetadata && typeof json.usageMetadata === "object" ? json.usageMetadata : json?.usage_metadata && typeof json.usage_metadata === "object" ? json.usage_metadata : null;
-    if (um) {
-      const pt = normalizeUsageInt(um.promptTokenCount ?? um.prompt_token_count);
-      const ct = normalizeUsageInt(um.candidatesTokenCount ?? um.candidates_token_count);
-      const cached = normalizeUsageInt(um.cachedContentTokenCount ?? um.cached_content_token_count ?? um.cachedTokenCount);
-      if (pt != null) usagePromptTokens = pt;
-      if (ct != null) usageCompletionTokens = ct;
-      if (cached != null) usageCacheReadInputTokens = cached;
-    }
-
     const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
     const c0 = candidates[0] && typeof candidates[0] === "object" ? candidates[0] : null;
-    const fr = normalizeString(c0?.finishReason ?? c0?.finish_reason);
-    if (fr) {
+    const usage = extractGeminiUsageTokens(json);
+    if (usage.usagePromptTokens != null) usagePromptTokens = usage.usagePromptTokens;
+    if (usage.usageCompletionTokens != null) usageCompletionTokens = usage.usageCompletionTokens;
+    if (usage.usageCacheReadInputTokens != null) usageCacheReadInputTokens = usage.usageCacheReadInputTokens;
+
+    const stop = extractGeminiStopReasonFromCandidate(c0);
+    if (stop.stopReasonSeen) {
       stopReasonSeen = true;
-      stopReason = mapGeminiFinishReasonToAugment(fr);
+      stopReason = stop.stopReason;
     }
 
     const parts = Array.isArray(c0?.content?.parts) ? c0.content.parts : [];
@@ -218,21 +201,11 @@ async function* geminiChatStreamChunks({ baseUrl, apiKey, model, systemInstructi
         const toolUseId = `tool-${sanitizeToolHint(toolName)}-${toolSeq}`;
         const inputJson = normalizeFunctionCallArgsToJsonString(fc.args ?? fc.arguments);
         const meta = getToolMeta(toolName);
-        sawToolUse = true;
-        if (supportToolUseStart === true) {
-          nodeId += 1;
-          emittedChunks += 1;
-          yield makeBackChatChunk({
-            text: "",
-            nodes: [toolUseStartNode({ id: nodeId, toolUseId, toolName, inputJson, mcpServerName: meta.mcpServerName, mcpToolName: meta.mcpToolName })]
-          });
-        }
-        nodeId += 1;
-        emittedChunks += 1;
-        yield makeBackChatChunk({
-          text: "",
-          nodes: [toolUseNode({ id: nodeId, toolUseId, toolName, inputJson, mcpServerName: meta.mcpServerName, mcpToolName: meta.mcpToolName })]
-        });
+        const built = buildToolUseChunks({ nodeId, toolUseId, toolName, inputJson, meta, supportToolUseStart });
+        nodeId = built.nodeId;
+        emittedChunks += built.chunks.length;
+        for (const c of built.chunks) yield c;
+        if (built.chunks.length) sawToolUse = true;
       }
     }
 
@@ -257,22 +230,17 @@ async function* geminiChatStreamChunks({ baseUrl, apiKey, model, systemInstructi
     throw new Error(`Gemini(chat-stream) 未解析到任何上游 SSE 内容（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 Gemini SSE`.trim());
   }
 
-  if (hasUsage) {
-    nodeId += 1;
-    yield makeBackChatChunk({
-      text: "",
-      nodes: [tokenUsageNode({ id: nodeId, inputTokens: usagePromptTokens, outputTokens: usageCompletionTokens, cacheReadInputTokens: usageCacheReadInputTokens })]
-    });
-  }
+  const usageBuilt = buildTokenUsageChunk({
+    nodeId,
+    inputTokens: usagePromptTokens,
+    outputTokens: usageCompletionTokens,
+    cacheReadInputTokens: usageCacheReadInputTokens
+  });
+  nodeId = usageBuilt.nodeId;
+  if (usageBuilt.chunk) yield usageBuilt.chunk;
 
-  const finalNodes = [];
-  if (fullText) {
-    nodeId += 1;
-    finalNodes.push(mainTextFinishedNode({ id: nodeId, content: fullText }));
-  }
-
-  const stop_reason = stopReasonSeen && stopReason != null ? stopReason : sawToolUse ? STOP_REASON_TOOL_USE_REQUESTED : STOP_REASON_END_TURN;
-  yield makeBackChatChunk({ text: "", nodes: finalNodes, stop_reason });
+  const final = buildFinalChatChunk({ nodeId, fullText, stopReasonSeen, stopReason, sawToolUse });
+  yield final.chunk;
 }
 
 module.exports = { geminiCompleteText, geminiStreamTextDeltas, geminiChatStreamChunks };

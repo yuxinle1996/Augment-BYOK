@@ -1,36 +1,26 @@
 "use strict";
 
-const { debug, warn } = require("../infra/log");
+const { warn } = require("../infra/log");
 const { withTiming } = require("../infra/trace");
-const { ensureConfigManager, state } = require("../config/state");
-const { decideRoute } = require("../core/router");
-const { normalizeEndpoint, normalizeString, normalizeRawToken, safeTransform, randomId } = require("../infra/util");
+const { normalizeString, normalizeRawToken, safeTransform } = require("../infra/util");
 const { getOfficialConnection } = require("../config/official");
 const { fetchOfficialGetModels, mergeModels } = require("./official");
-const { normalizeAugmentChatRequest, buildSystemPrompt, buildOpenAiMessages, buildOpenAiResponsesInput, buildAnthropicMessages, buildGeminiContents } = require("../core/augment-chat");
-const { openAiCompleteText } = require("../providers/openai");
-const { openAiResponsesCompleteText } = require("../providers/openai-responses");
-const { anthropicCompleteText } = require("../providers/anthropic");
-const { geminiCompleteText } = require("../providers/gemini");
-const { buildMessagesForEndpoint, makeBackTextResult, makeBackChatResult, makeBackCompletionResult, buildByokModelsFromConfig, makeBackGetModelsResult, makeModelInfo } = require("../core/protocol");
+const {
+  buildMessagesForEndpoint,
+  makeBackTextResult,
+  makeBackCompletionResult,
+  makeBackNextEditLocationResult,
+  buildByokModelsFromConfig,
+  makeBackGetModelsResult,
+  makeModelInfo
+} = require("../core/protocol");
 const { parseNextEditLocCandidatesFromText, mergeNextEditLocCandidates } = require("../core/next-edit-loc-utils");
 const { pickPath, pickNumResults } = require("../core/next-edit-fields");
 const { byokCompleteText } = require("./shim-byok-text");
+const { byokChat } = require("./shim-byok-chat");
+const { resolveByokRouteContext } = require("./shim-route");
 const { maybeAugmentBodyWithWorkspaceBlob, pickNextEditLocationCandidates } = require("./shim-next-edit");
-const {
-  captureAugmentChatToolDefinitions,
-  summarizeAugmentChatRequest,
-  isAugmentChatRequestEmpty,
-  logAugmentChatStart,
-  prepareAugmentChatRequestForByok
-} = require("./shim-augment-chat");
-const {
-  normalizeTimeoutMs,
-  maybeDeleteHistorySummaryCacheForEndpoint,
-  providerLabel,
-  formatRouteForLog,
-  providerRequestContext
-} = require("./shim-common");
+const { providerLabel } = require("./shim-common");
 
 async function handleGetModels({ cfg, ep, transform, abortSignal, timeoutMs, upstreamApiToken, upstreamCompletionURL, requestId }) {
   const byokModels = buildByokModelsFromConfig(cfg);
@@ -58,93 +48,39 @@ async function handleGetModels({ cfg, ep, transform, abortSignal, timeoutMs, ups
   }
 }
 
-async function handleCompletion({ route, ep, body, transform, timeoutMs, abortSignal, requestId }) {
+async function completeTextForEndpoint({ route, ep, body, timeoutMs, abortSignal, requestId, kind }) {
   const { system, messages } = buildMessagesForEndpoint(ep, body);
-  const label = `[callApi ${ep}] rid=${requestId} complete provider=${providerLabel(route.provider)} model=${normalizeString(route.model) || "unknown"}`;
-  const text = await withTiming(label, async () =>
+  const suffix = normalizeString(kind) || "complete";
+  const label = `[callApi ${ep}] rid=${requestId} ${suffix} provider=${providerLabel(route.provider)} model=${normalizeString(route.model) || "unknown"}`;
+  return await withTiming(label, async () =>
     await byokCompleteText({ provider: route.provider, model: route.model, system, messages, timeoutMs, abortSignal })
   );
+}
+
+async function handleCompletion({ route, ep, body, transform, timeoutMs, abortSignal, requestId }) {
+  const text = await completeTextForEndpoint({ route, ep, body, timeoutMs, abortSignal, requestId, kind: "complete" });
   return safeTransform(transform, makeBackCompletionResult(text), ep);
 }
 
 async function handleEdit({ route, ep, body, transform, timeoutMs, abortSignal, requestId }) {
-  const { system, messages } = buildMessagesForEndpoint(ep, body);
-  const label = `[callApi ${ep}] rid=${requestId} edit provider=${providerLabel(route.provider)} model=${normalizeString(route.model) || "unknown"}`;
-  const text = await withTiming(label, async () =>
-    await byokCompleteText({ provider: route.provider, model: route.model, system, messages, timeoutMs, abortSignal })
-  );
+  const text = await completeTextForEndpoint({ route, ep, body, timeoutMs, abortSignal, requestId, kind: "edit" });
   return safeTransform(transform, makeBackTextResult(text), ep);
 }
 
 async function handleChat({ cfg, route, ep, body, transform, timeoutMs, abortSignal, upstreamApiToken, upstreamCompletionURL, requestId }) {
-  const { type, baseUrl, apiKey, extraHeaders, requestDefaults } = providerRequestContext(route.provider);
-  const req = normalizeAugmentChatRequest(body);
-  const conversationId = normalizeString(req?.conversation_id ?? req?.conversationId ?? req?.conversationID);
-  captureAugmentChatToolDefinitions({
-    endpoint: "/chat",
-    req,
+  const out = await byokChat({
+    cfg,
     provider: route.provider,
-    providerType: type,
-    requestedModel: route.requestedModel,
-    conversationId,
-    requestId
-  });
-
-  const summary = summarizeAugmentChatRequest(req);
-  logAugmentChatStart({
-    kind: "chat",
-    requestId,
-    provider: route.provider,
-    providerType: type,
     model: route.model,
     requestedModel: route.requestedModel,
-    conversationId,
-    summary
-  });
-
-  if (isAugmentChatRequestEmpty(summary)) return safeTransform(transform, makeBackChatResult("", { nodes: [] }), ep);
-
-  await prepareAugmentChatRequestForByok({
-    cfg,
-    req,
-    requestedModel: route.requestedModel,
-    fallbackProvider: route.provider,
-    fallbackModel: route.model,
+    body,
     timeoutMs,
     abortSignal,
     upstreamCompletionURL,
     upstreamApiToken,
     requestId
   });
-
-  const chatLabel = `[callApi ${ep}] rid=${requestId} provider=${providerLabel(route.provider)} type=${type || "unknown"} model=${normalizeString(route.model) || "unknown"}`;
-  if (type === "openai_compatible") {
-    const text = await withTiming(chatLabel, async () =>
-      await openAiCompleteText({ baseUrl, apiKey, model: route.model, messages: buildOpenAiMessages(req), timeoutMs, abortSignal, extraHeaders, requestDefaults })
-    );
-    return safeTransform(transform, makeBackChatResult(text, { nodes: [] }), ep);
-  }
-  if (type === "anthropic") {
-    const text = await withTiming(chatLabel, async () =>
-      await anthropicCompleteText({ baseUrl, apiKey, model: route.model, system: buildSystemPrompt(req), messages: buildAnthropicMessages(req), timeoutMs, abortSignal, extraHeaders, requestDefaults })
-    );
-    return safeTransform(transform, makeBackChatResult(text, { nodes: [] }), ep);
-  }
-  if (type === "openai_responses") {
-    const { instructions, input } = buildOpenAiResponsesInput(req);
-    const text = await withTiming(chatLabel, async () =>
-      await openAiResponsesCompleteText({ baseUrl, apiKey, model: route.model, instructions, input, timeoutMs, abortSignal, extraHeaders, requestDefaults })
-    );
-    return safeTransform(transform, makeBackChatResult(text, { nodes: [] }), ep);
-  }
-  if (type === "gemini_ai_studio") {
-    const { systemInstruction, contents } = buildGeminiContents(req);
-    const text = await withTiming(chatLabel, async () =>
-      await geminiCompleteText({ baseUrl, apiKey, model: route.model, systemInstruction, contents, timeoutMs, abortSignal, extraHeaders, requestDefaults })
-    );
-    return safeTransform(transform, makeBackChatResult(text, { nodes: [] }), ep);
-  }
-  throw new Error(`未知 provider.type: ${type}`);
+  return safeTransform(transform, out, ep);
 }
 
 async function handleNextEditLoc({ route, ep, body, transform, timeoutMs, abortSignal, requestId }) {
@@ -157,11 +93,7 @@ async function handleNextEditLoc({ route, ep, body, transform, timeoutMs, abortS
 
   try {
     const bodyForPrompt = await maybeAugmentBodyWithWorkspaceBlob(body, { pathHint: fallbackPath });
-    const { system, messages } = buildMessagesForEndpoint(ep, bodyForPrompt);
-    const label = `[callApi ${ep}] rid=${requestId} llm provider=${providerLabel(route.provider)} model=${normalizeString(route.model) || "unknown"}`;
-    const text = await withTiming(label, async () =>
-      await byokCompleteText({ provider: route.provider, model: route.model, system, messages, timeoutMs, abortSignal })
-    );
+    const text = await completeTextForEndpoint({ route, ep, body: bodyForPrompt, timeoutMs, abortSignal, requestId, kind: "llm" });
     llmCandidates = parseNextEditLocCandidatesFromText(text, { fallbackPath, max, source: "byok:llm" });
   } catch (err) {
     warn("next_edit_loc llm fallback to diagnostics", { requestId, error: err instanceof Error ? err.message : String(err) });
@@ -173,17 +105,14 @@ async function handleNextEditLoc({ route, ep, body, transform, timeoutMs, abortS
 }
 
 async function maybeHandleCallApi({ endpoint, body, transform, timeoutMs, abortSignal, upstreamApiToken, upstreamCompletionURL }) {
-  const requestId = randomId();
-  const ep = normalizeEndpoint(endpoint);
+  const { requestId, ep, timeoutMs: t, cfg, route, runtimeEnabled } = await resolveByokRouteContext({
+    endpoint,
+    body,
+    timeoutMs,
+    logPrefix: "callApi"
+  });
   if (!ep) return undefined;
-  await maybeDeleteHistorySummaryCacheForEndpoint(ep, body);
-
-  const cfgMgr = ensureConfigManager();
-  const cfg = cfgMgr.get();
-  if (!state.runtimeEnabled) return undefined;
-
-  const route = decideRoute({ cfg, endpoint: ep, body, runtimeEnabled: state.runtimeEnabled });
-  debug(`[callApi] ${formatRouteForLog(route, { requestId })}`);
+  if (!runtimeEnabled) return undefined;
   if (route.mode === "official") return undefined;
   if (route.mode === "disabled") {
     try {
@@ -193,8 +122,6 @@ async function maybeHandleCallApi({ endpoint, body, transform, timeoutMs, abortS
     }
   }
   if (route.mode !== "byok") return undefined;
-
-  const t = normalizeTimeoutMs(timeoutMs);
 
   try {
     if (ep === "/get-models") {

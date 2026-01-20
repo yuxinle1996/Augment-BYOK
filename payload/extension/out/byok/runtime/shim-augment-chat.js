@@ -9,6 +9,9 @@ const {
   maybeInjectOfficialContextCanvas,
   maybeInjectOfficialExternalSources
 } = require("./official");
+const { maybeHydrateAssetNodesFromUpstream } = require("./upstream-assets");
+const { maybeHydrateCheckpointNodesFromUpstream } = require("./upstream-checkpoints");
+const { deriveWorkspaceFileChunksFromRequest } = require("./workspace-file-chunks");
 const { providerLabel } = require("./shim-common");
 
 function captureAugmentChatToolDefinitions({ endpoint, req, provider, providerType, requestedModel, conversationId, requestId }) {
@@ -60,6 +63,21 @@ function logAugmentChatStart({ kind, requestId, provider, providerType, model, r
 
 async function prepareAugmentChatRequestForByok({ cfg, req, requestedModel, fallbackProvider, fallbackModel, timeoutMs, abortSignal, upstreamCompletionURL, upstreamApiToken, requestId }) {
   const rid = normalizeString(requestId);
+  const meta = { checkpointNotFound: false, workspaceFileChunks: [] };
+
+  try {
+    await maybeHydrateAssetNodesFromUpstream(req, { timeoutMs, abortSignal });
+  } catch (err) {
+    warn("upstream assets hydrate failed (ignored)", { requestId: rid, error: err instanceof Error ? err.message : String(err) });
+  }
+
+  try {
+    const res = await maybeHydrateCheckpointNodesFromUpstream(req, { timeoutMs, abortSignal });
+    if (res && typeof res === "object" && res.checkpointNotFound === true) meta.checkpointNotFound = true;
+  } catch (err) {
+    warn("upstream checkpoints hydrate failed (ignored)", { requestId: rid, error: err instanceof Error ? err.message : String(err) });
+  }
+
   try {
     await maybeSummarizeAndCompactAugmentChatRequest({
       cfg,
@@ -77,6 +95,14 @@ async function prepareAugmentChatRequestForByok({ cfg, req, requestedModel, fall
   await maybeInjectOfficialCodebaseRetrieval({ req, timeoutMs, abortSignal, upstreamCompletionURL, upstreamApiToken });
   await maybeInjectOfficialContextCanvas({ req, timeoutMs, abortSignal, upstreamCompletionURL, upstreamApiToken });
   await maybeInjectOfficialExternalSources({ req, timeoutMs, abortSignal, upstreamCompletionURL, upstreamApiToken });
+
+  try {
+    meta.workspaceFileChunks = deriveWorkspaceFileChunksFromRequest(req, { maxChunks: 80 });
+  } catch {
+    meta.workspaceFileChunks = [];
+  }
+
+  return meta;
 }
 
 function resolveSupportToolUseStart(req) {
@@ -85,12 +111,18 @@ function resolveSupportToolUseStart(req) {
   return fdf.support_tool_use_start === true || fdf.supportToolUseStart === true;
 }
 
+function resolveSupportParallelToolUse(req) {
+  const r = req && typeof req === "object" ? req : {};
+  const fdf = r.feature_detection_flags && typeof r.feature_detection_flags === "object" ? r.feature_detection_flags : {};
+  return fdf.support_parallel_tool_use === true || fdf.supportParallelToolUse === true;
+}
+
 module.exports = {
   captureAugmentChatToolDefinitions,
   summarizeAugmentChatRequest,
   isAugmentChatRequestEmpty,
   logAugmentChatStart,
   prepareAugmentChatRequestForByok,
-  resolveSupportToolUseStart
+  resolveSupportToolUseStart,
+  resolveSupportParallelToolUse
 };
-

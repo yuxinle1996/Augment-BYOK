@@ -7,6 +7,12 @@ const { withJsonContentType, openAiAuthHeaders } = require("./headers");
 const { normalizeUsageInt, makeToolMetaGetter, assertSseResponse } = require("./provider-util");
 const { fetchOkWithRetry, extractErrorMessageFromJson } = require("./request-util");
 const {
+  extractToolCallsFromResponseOutput,
+  extractReasoningSummaryFromResponseOutput,
+  extractTextFromResponsesJson,
+  emitOpenAiResponsesJsonAsAugmentChunks
+} = require("./openai-responses-util");
+const {
   STOP_REASON_END_TURN,
   STOP_REASON_MAX_TOKENS,
   STOP_REASON_TOOL_USE_REQUESTED,
@@ -45,33 +51,9 @@ async function openAiResponsesCompleteText({ baseUrl, apiKey, model, instruction
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(responses)" });
 
   const json = await resp.json().catch(() => null);
-  const direct = normalizeString(json?.output_text ?? json?.outputText ?? json?.text);
-  if (direct) return direct;
-
   const output = Array.isArray(json?.output) ? json.output : [];
-  const parts = [];
-  for (const it of output) {
-    if (!it || typeof it !== "object") continue;
-    if (it.type === "message" && it.role === "assistant") {
-      const content = it.content;
-      if (typeof content === "string" && content.trim()) {
-        parts.push(content);
-        continue;
-      }
-      const blocks = Array.isArray(content) ? content : [];
-      for (const b of blocks) {
-        if (!b || typeof b !== "object") continue;
-        if ((b.type === "output_text" || b.type === "text") && typeof b.text === "string" && b.text) parts.push(b.text);
-      }
-      continue;
-    }
-    if ((it.type === "output_text" || it.type === "text") && typeof it.text === "string" && it.text) {
-      parts.push(it.text);
-      continue;
-    }
-  }
-  const joined = parts.join("").trim();
-  if (joined) return joined;
+  const direct = extractTextFromResponsesJson(json);
+  if (direct) return direct;
 
   const hasToolCall = output.some((it) => it && typeof it === "object" && it.type === "function_call");
   if (hasToolCall) throw new Error("OpenAI(responses) 返回 function_call（当前调用不执行工具；请改用 /chat-stream）");
@@ -101,6 +83,16 @@ async function openAiResponsesCompleteText({ baseUrl, apiKey, model, instruction
 async function* openAiResponsesStreamTextDeltas({ baseUrl, apiKey, model, instructions, input, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
   const { url, headers, body } = buildOpenAiResponsesRequest({ baseUrl, apiKey, model, instructions, input, tools: [], extraHeaders, requestDefaults, stream: true });
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(responses-stream)" });
+  const contentType = normalizeString(resp?.headers?.get?.("content-type")).toLowerCase();
+  if (contentType.includes("json")) {
+    const json = await resp.json().catch(() => null);
+    const text = extractTextFromResponsesJson(json);
+    if (text) {
+      yield text;
+      return;
+    }
+    throw new Error(`OpenAI(responses-stream) JSON 响应缺少可解析文本（content-type=${contentType || "unknown"}）`.trim());
+  }
   await assertSseResponse(resp, { label: "OpenAI(responses-stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /responses SSE" });
 
   let dataEvents = 0;
@@ -130,43 +122,17 @@ async function* openAiResponsesStreamTextDeltas({ baseUrl, apiKey, model, instru
   if (emitted === 0) throw new Error(`OpenAI(responses-stream) 未解析到任何 SSE delta（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 OpenAI SSE`.trim());
 }
 
-function extractToolCallsFromResponseOutput(output) {
-  const list = Array.isArray(output) ? output : [];
-  const out = [];
-  for (const it of list) {
-    if (!it || typeof it !== "object") continue;
-    if (it.type !== "function_call") continue;
-    const call_id = normalizeString(it.call_id);
-    const name = normalizeString(it.name);
-    const args = typeof it.arguments === "string" ? it.arguments : "";
-    if (!call_id || !name) continue;
-    out.push({ call_id, name, arguments: normalizeString(args) || "{}" });
-  }
-  return out;
-}
-
-function extractReasoningSummaryFromResponseOutput(output) {
-  const list = Array.isArray(output) ? output : [];
-  const parts = [];
-  for (const it of list) {
-    if (!it || typeof it !== "object") continue;
-    if (it.type !== "reasoning") continue;
-    const summary = Array.isArray(it.summary) ? it.summary : [];
-    for (const s of summary) {
-      if (!s || typeof s !== "object") continue;
-      if (s.type !== "summary_text") continue;
-      const text = normalizeString(s.text);
-      if (text) parts.push(text);
-    }
-  }
-  return parts.join("\n").trim();
-}
-
 async function* openAiResponsesChatStreamChunks({ baseUrl, apiKey, model, instructions, input, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart }) {
   const getToolMeta = makeToolMetaGetter(toolMetaByName);
 
   const { url, headers, body } = buildOpenAiResponsesRequest({ baseUrl, apiKey, model, instructions, input, tools, extraHeaders, requestDefaults, stream: true });
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(responses-chat-stream)" });
+  const contentType = normalizeString(resp?.headers?.get?.("content-type")).toLowerCase();
+  if (contentType.includes("json")) {
+    const json = await resp.json().catch(() => null);
+    yield* emitOpenAiResponsesJsonAsAugmentChunks(json, { toolMetaByName, supportToolUseStart });
+    return;
+  }
   await assertSseResponse(resp, { label: "OpenAI(responses-chat-stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /responses SSE" });
 
   let nodeId = 0;

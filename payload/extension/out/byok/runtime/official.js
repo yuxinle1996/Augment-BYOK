@@ -4,6 +4,7 @@ const { debug, warn } = require("../infra/log");
 const { normalizeString, normalizeRawToken } = require("../infra/util");
 const { truncateTextForPrompt: truncateText } = require("../infra/text");
 const augmentChatShared = require("../core/augment-chat.shared");
+const { normalizeOfficialBlobsDiff } = require("../core/blob-utils");
 const { REQUEST_NODE_TEXT, REQUEST_NODE_TOOL_RESULT } = require("../core/augment-protocol");
 const { ensureModelRegistryFeatureFlags } = require("../core/model-registry");
 const { makeModelInfo } = require("../core/protocol");
@@ -210,18 +211,6 @@ function formatExternalSourcesForPrompt(results, { selectedExternalSourceIds } =
   return lines.join("\n").trim();
 }
 
-function normalizeOfficialBlobs(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const b = raw;
-  const checkpointIdRaw = Object.prototype.hasOwnProperty.call(b, "checkpoint_id") ? b.checkpoint_id : b.checkpointId ?? b.checkpointID ?? null;
-  const addedBlobsRaw = Object.prototype.hasOwnProperty.call(b, "added_blobs") ? b.added_blobs : b.addedBlobs;
-  const deletedBlobsRaw = Object.prototype.hasOwnProperty.call(b, "deleted_blobs") ? b.deleted_blobs : b.deletedBlobs;
-  const checkpoint_id = normalizeString(checkpointIdRaw) || null;
-  const added_blobs = Array.isArray(addedBlobsRaw) ? addedBlobsRaw : [];
-  const deleted_blobs = Array.isArray(deletedBlobsRaw) ? deletedBlobsRaw : [];
-  return { checkpoint_id, added_blobs, deleted_blobs };
-}
-
 function normalizeStringList(raw, { maxItems } = {}) {
   const lim = Number.isFinite(Number(maxItems)) && Number(maxItems) > 0 ? Math.floor(Number(maxItems)) : 100;
   const out = [];
@@ -245,7 +234,7 @@ async function fetchOfficialCodebaseRetrieval({ completionURL, apiToken, informa
   const max_output_length = Number.isFinite(Number(maxOutputLength)) && Number(maxOutputLength) > 0 ? Math.floor(Number(maxOutputLength)) : 20000;
   const basePayload = {
     information_request: String(informationRequest || ""),
-    blobs: normalizeOfficialBlobs(blobs) || { checkpoint_id: null, added_blobs: [], deleted_blobs: [] },
+    blobs: normalizeOfficialBlobsDiff(blobs) || { checkpoint_id: null, added_blobs: [], deleted_blobs: [] },
     dialog: [],
     max_output_length
   };
@@ -389,7 +378,7 @@ async function maybeInjectOfficialCodebaseRetrieval({ req, timeoutMs, abortSigna
   const hardTimeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : 120000;
   const t = Math.max(2000, Math.min(OFFICIAL_CODEBASE_RETRIEVAL_TIMEOUT_MS, Math.floor(hardTimeout * 0.5)));
 
-  const baseBlobs = normalizeOfficialBlobs(req.blobs) || { checkpoint_id: null, added_blobs: [], deleted_blobs: [] };
+  const baseBlobs = normalizeOfficialBlobsDiff(req.blobs) || { checkpoint_id: null, added_blobs: [], deleted_blobs: [] };
   const userGuidedBlobs = Array.isArray(req.user_guided_blobs) ? req.user_guided_blobs : [];
   const userGuidedBlobNames = userGuidedBlobs.map((b) => normalizeString(String(b ?? ""))).filter(Boolean);
 
@@ -569,4 +558,3 @@ module.exports = {
   maybeInjectOfficialContextCanvas,
   maybeInjectOfficialExternalSources
 };
-

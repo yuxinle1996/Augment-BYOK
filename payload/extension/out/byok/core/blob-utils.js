@@ -25,6 +25,37 @@ function looksLikeOfficialBlobsDiff(raw) {
   return true;
 }
 
+function normalizeStringList(raw, { maxItems } = {}) {
+  const lim = Number.isFinite(Number(maxItems)) && Number(maxItems) > 0 ? Math.floor(Number(maxItems)) : 500;
+  const out = [];
+  const seen = new Set();
+  const list = Array.isArray(raw) ? raw : [];
+  for (const v of list) {
+    const s = normalizeString(String(v ?? ""));
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+    if (out.length >= lim) break;
+  }
+  return out;
+}
+
+function normalizeOfficialBlobsDiff(raw) {
+  const b = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  if (!b) return null;
+  if (!looksLikeOfficialBlobsDiff(b)) return null;
+
+  const checkpointRaw = Object.prototype.hasOwnProperty.call(b, "checkpoint_id") ? b.checkpoint_id : b.checkpointId ?? b.checkpointID ?? null;
+  const addedRaw = Object.prototype.hasOwnProperty.call(b, "added_blobs") ? b.added_blobs : b.addedBlobs;
+  const deletedRaw = Object.prototype.hasOwnProperty.call(b, "deleted_blobs") ? b.deleted_blobs : b.deletedBlobs;
+
+  const checkpoint_id = normalizeString(checkpointRaw) || null;
+  const added_blobs = normalizeStringList(addedRaw, { maxItems: 800 });
+  const deleted_blobs = normalizeStringList(deletedRaw, { maxItems: 800 });
+
+  return { checkpoint_id, added_blobs, deleted_blobs };
+}
+
 function coerceBlobText(v) {
   if (typeof v === "string") return v;
   const r = v && typeof v === "object" ? v : null;
@@ -132,6 +163,7 @@ function getBlobValue(blobs, blobName) {
 module.exports = {
   coerceBlobText,
   normalizeBlobsMap,
+  normalizeOfficialBlobsDiff,
   listBlobKeys,
   pickBestBlobName,
   getBlobValue

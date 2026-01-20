@@ -1,10 +1,8 @@
 "use strict";
 
-const { debug, warn } = require("../infra/log");
+const { warn } = require("../infra/log");
 const { withTiming, traceAsyncGenerator } = require("../infra/trace");
-const { ensureConfigManager, state } = require("../config/state");
-const { decideRoute } = require("../core/router");
-const { normalizeEndpoint, normalizeString, safeTransform, emptyAsyncGenerator, randomId } = require("../infra/util");
+const { normalizeString, safeTransform, emptyAsyncGenerator } = require("../infra/util");
 const { makeEndpointErrorText, guardObjectStream } = require("../core/stream-guard");
 const { buildMessagesForEndpoint, makeBackChatResult, makeBackNextEditGenerationChunk } = require("../core/protocol");
 const { pickPath, pickBlobNameHint } = require("../core/next-edit-fields");
@@ -12,13 +10,9 @@ const { buildNextEditStreamRuntimeContext } = require("../core/next-edit-stream-
 const { STOP_REASON_END_TURN, makeBackChatChunk } = require("../core/augment-protocol");
 const { byokCompleteText, byokStreamText } = require("./shim-byok-text");
 const { byokChatStream } = require("./shim-byok-chat-stream");
+const { resolveByokRouteContext } = require("./shim-route");
 const { maybeAugmentBodyWithWorkspaceBlob, buildInstructionReplacementMeta } = require("./shim-next-edit");
-const {
-  normalizeTimeoutMs,
-  maybeDeleteHistorySummaryCacheForEndpoint,
-  providerLabel,
-  formatRouteForLog
-} = require("./shim-common");
+const { providerLabel, formatRouteForLog } = require("./shim-common");
 
 function guardWithMeta({ ep, src, transform, makeErrorChunk, requestId, route }) {
   return guardObjectStream({
@@ -128,22 +122,17 @@ async function handleNextEditStream({ route, ep, body, transform, timeoutMs, abo
 }
 
 async function maybeHandleCallApiStream({ endpoint, body, transform, timeoutMs, abortSignal, upstreamApiToken, upstreamCompletionURL }) {
-  const requestId = randomId();
-  const ep = normalizeEndpoint(endpoint);
+  const { requestId, ep, timeoutMs: t, cfg, route, runtimeEnabled } = await resolveByokRouteContext({
+    endpoint,
+    body,
+    timeoutMs,
+    logPrefix: "callApiStream"
+  });
   if (!ep) return undefined;
-  await maybeDeleteHistorySummaryCacheForEndpoint(ep, body);
-
-  const cfgMgr = ensureConfigManager();
-  const cfg = cfgMgr.get();
-  if (!state.runtimeEnabled) return undefined;
-
-  const route = decideRoute({ cfg, endpoint: ep, body, runtimeEnabled: state.runtimeEnabled });
-  debug(`[callApiStream] ${formatRouteForLog(route, { requestId })}`);
+  if (!runtimeEnabled) return undefined;
   if (route.mode === "official") return undefined;
   if (route.mode === "disabled") return emptyAsyncGenerator();
   if (route.mode !== "byok") return undefined;
-
-  const t = normalizeTimeoutMs(timeoutMs);
 
   try {
     if (ep === "/chat-stream") {

@@ -1,9 +1,7 @@
 "use strict";
 
-const { joinBaseUrl } = require("./http");
 const { parseSse } = require("./sse");
-const { normalizeString, requireString, normalizeRawToken, stripByokInternalKeys } = require("../infra/util");
-const { withJsonContentType, openAiAuthHeaders } = require("./headers");
+const { normalizeString } = require("../infra/util");
 const { normalizeUsageInt, makeToolMetaGetter, assertSseResponse } = require("./provider-util");
 const { fetchOkWithRetry, extractErrorMessageFromJson } = require("./request-util");
 const {
@@ -19,38 +17,56 @@ const {
   makeBackChatChunk
 } = require("../core/augment-protocol");
 
-function buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools, extraHeaders, requestDefaults, stream, includeUsage }) {
-  const url = joinBaseUrl(requireString(baseUrl, "OpenAI baseUrl"), "chat/completions");
-  const key = normalizeRawToken(apiKey);
-  const extra = extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {};
-  if (!key && Object.keys(extra).length === 0) throw new Error("OpenAI apiKey 未配置（且 headers 为空）");
-  const m = requireString(model, "OpenAI model");
-  if (!Array.isArray(messages) || !messages.length) throw new Error("OpenAI messages 为空");
-  const rd = stripByokInternalKeys(requestDefaults);
-  const body = { ...rd, model: m, messages, stream: Boolean(stream) };
-  if (stream && includeUsage) body.stream_options = { include_usage: true };
-  if (Array.isArray(tools) && tools.length) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
-  const headers = withJsonContentType(openAiAuthHeaders(key, extraHeaders));
-  if (stream) headers.accept = "text/event-stream";
-  return { url, headers, body };
-}
+const {
+  buildOpenAiRequest,
+  postOpenAiChatStreamWithFallbacks,
+} = require("./openai-chat-completions-util");
+const { extractTextFromChatCompletionJson, emitChatCompletionJsonAsAugmentChunks } = require("./openai-chat-completions-json-util");
 
 async function openAiCompleteText({ baseUrl, apiKey, model, messages, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
-  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools: [], extraHeaders, requestDefaults, stream: false, includeUsage: false });
+  const { url, headers, body } = buildOpenAiRequest({
+    baseUrl,
+    apiKey,
+    model,
+    messages,
+    tools: [],
+    extraHeaders,
+    requestDefaults,
+    stream: false,
+    includeUsage: false,
+    includeToolChoice: false
+  });
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI" });
   const json = await resp.json().catch(() => null);
-  const text = json?.choices?.[0]?.message?.content;
-  if (typeof text !== "string") throw new Error("OpenAI 响应缺少 choices[0].message.content");
-  return text;
+  const text = extractTextFromChatCompletionJson(json);
+  if (text) return text;
+  throw new Error("OpenAI 响应缺少可解析文本（choices[0].message.content / choices[0].text）");
 }
 
 async function* openAiStreamTextDeltas({ baseUrl, apiKey, model, messages, timeoutMs, abortSignal, extraHeaders, requestDefaults }) {
-  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools: [], extraHeaders, requestDefaults, stream: true, includeUsage: false });
+  const { url, headers, body } = buildOpenAiRequest({
+    baseUrl,
+    apiKey,
+    model,
+    messages,
+    tools: [],
+    extraHeaders,
+    requestDefaults,
+    stream: true,
+    includeUsage: false,
+    includeToolChoice: false
+  });
   const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(stream)" });
-  await assertSseResponse(resp, { label: "OpenAI(stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /chat/completions" });
+  const contentType = normalizeString(resp?.headers?.get?.("content-type")).toLowerCase();
+  if (contentType.includes("json")) {
+    const json = await resp.json().catch(() => null);
+    const text = extractTextFromChatCompletionJson(json);
+    if (text) {
+      yield text;
+      return;
+    }
+    throw new Error(`OpenAI(stream) JSON 响应缺少可解析文本（content-type=${contentType || "unknown"}）`.trim());
+  }
   let dataEvents = 0;
   let parsedChunks = 0;
   let emitted = 0;
@@ -70,7 +86,12 @@ async function* openAiStreamTextDeltas({ baseUrl, apiKey, model, messages, timeo
     const text = typeof delta?.content === "string" ? delta.content : "";
     if (text) { emitted += 1; yield text; }
   }
-  if (emitted === 0) throw new Error(`OpenAI(stream) 未解析到任何 SSE delta（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）；请检查 baseUrl 是否为 OpenAI SSE`.trim());
+  if (emitted === 0) {
+    if (contentType && !contentType.includes("text/event-stream")) {
+      await assertSseResponse(resp, { label: "OpenAI(stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /chat/completions" });
+    }
+    throw new Error(`OpenAI(stream) 未解析到任何 SSE delta（data_events=${dataEvents}, parsed_chunks=${parsedChunks}）`.trim());
+  }
 }
 
 function normalizeToolCallIndex(v) {
@@ -84,10 +105,35 @@ function ensureToolCallRecord(toolCallsByIndex, index) {
   return toolCallsByIndex.get(idx);
 }
 
-async function* openAiChatStreamChunks({ baseUrl, apiKey, model, messages, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults, toolMetaByName, supportToolUseStart }) {
-  const { url, headers, body } = buildOpenAiRequest({ baseUrl, apiKey, model, messages, tools, extraHeaders, requestDefaults, stream: true, includeUsage: true });
-  const resp = await fetchOkWithRetry(url, { method: "POST", headers, body: JSON.stringify(body) }, { timeoutMs, abortSignal, label: "OpenAI(chat-stream)" });
-  await assertSseResponse(resp, { label: "OpenAI(chat-stream)", expectedHint: "请确认 baseUrl 指向 OpenAI /chat/completions SSE" });
+async function* openAiChatStreamChunks({
+  baseUrl,
+  apiKey,
+  model,
+  messages,
+  tools,
+  timeoutMs,
+  abortSignal,
+  extraHeaders,
+  requestDefaults,
+  toolMetaByName,
+  supportToolUseStart,
+  supportParallelToolUse
+}) {
+  const hasTools = Array.isArray(tools) && tools.length > 0;
+  const rdRaw = requestDefaults && typeof requestDefaults === "object" && !Array.isArray(requestDefaults) ? requestDefaults : {};
+  const rd = hasTools && supportParallelToolUse !== true ? { ...rdRaw } : rdRaw;
+  if (hasTools && supportParallelToolUse !== true) {
+    if (!("parallel_tool_calls" in rd) && !("parallelToolCalls" in rd)) rd.parallel_tool_calls = false;
+  }
+
+  const resp = await postOpenAiChatStreamWithFallbacks({ baseUrl, apiKey, model, messages, tools, timeoutMs, abortSignal, extraHeaders, requestDefaults: rd });
+
+  const contentType = normalizeString(resp?.headers?.get?.("content-type")).toLowerCase();
+  if (contentType.includes("json")) {
+    const json = await resp.json().catch(() => null);
+    yield* emitChatCompletionJsonAsAugmentChunks(json, { toolMetaByName, supportToolUseStart });
+    return;
+  }
 
   const getToolMeta = makeToolMetaGetter(toolMetaByName);
 
