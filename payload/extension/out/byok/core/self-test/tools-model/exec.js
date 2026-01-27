@@ -63,6 +63,11 @@ async function selfTestToolsModelExec({ toolDefinitions, timeoutMs, abortSignal,
     results.set(name, { ok: nextOk, detail: normalizeString(detail) || "" });
   };
 
+  // 一些工具在真实 Augment 环境里属于 remoteToolHost（走 /agents/* 或 /relay/agents/*）。
+  // 在 BYOK/代理环境未实现 Agents API 时，这类工具可能稳定 404，但这并不影响本地 sidecar 工具与核心 BYOK 能力。
+  // Self Test 仍会记录该工具的失败细节，但不会让 toolsExec 作为“全局健康度”失败。
+  const OPTIONAL_TOOL_FAILURES = new Set(["web-search"]);
+
   const callIfPresent = async (name, input) => {
     if (!byName.has(name)) return { ok: true, skipped: true, detail: "tool not in captured list" };
     emit(`[toolsExec] calling ${name} ...`);
@@ -93,21 +98,39 @@ async function selfTestToolsModelExec({ toolDefinitions, timeoutMs, abortSignal,
   for (const n of missing) results.set(n, { ok: false, detail: "not executed" });
 
   const failed = Array.from(results.entries()).filter(([, v]) => v && v.ok === false);
-  const failedNames = failed.map(([name]) => name).filter(Boolean);
-  const ok = failed.length === 0;
+  const failedOptional = failed.filter(([name]) => OPTIONAL_TOOL_FAILURES.has(name));
+  const failedRequired = failed.filter(([name]) => !OPTIONAL_TOOL_FAILURES.has(name));
+  const failedNames = failedRequired.map(([name]) => name).filter(Boolean);
+  const failedOptionalNames = failedOptional.map(([name]) => name).filter(Boolean);
+  const ok = failedRequired.length === 0;
   const ms = nowMs() - t0;
-  debug(`[self-test][toolsExec] done ok=${String(ok)} failed=${failed.length} ms=${ms}`);
+  debug(
+    `[self-test][toolsExec] done ok=${String(ok)} failed_required=${failedRequired.length} failed_optional=${failedOptional.length} ms=${ms}`
+  );
   const failedPreview = failedNames.slice(0, 8).join(",");
+  const optionalFailedPreview = failedOptionalNames.slice(0, 8).join(",");
   const detail =
-    `tools=${toolNames.length} executed=${results.size} failed=${failed.length}` +
-    (failed.length ? ` first=${failed[0][0]}` : "") +
+    `tools=${toolNames.length} executed=${results.size} failed=${failedRequired.length}` +
+    (failedRequired.length ? ` first=${failedRequired[0][0]}` : "") +
     (failedNames.length ? ` failed_tools=${failedPreview}${failedNames.length > 8 ? ",…" : ""}` : "");
-  emit(`[toolsExec] done ok=${String(ok)} ${detail}`);
+  const detailWithOptional =
+    detail +
+    (failedOptional.length
+      ? ` optional_failed=${failedOptional.length}` +
+        (failedOptionalNames.length ? ` optional_failed_tools=${optionalFailedPreview}${failedOptionalNames.length > 8 ? ",…" : ""}` : "")
+      : "");
+  emit(`[toolsExec] done ok=${String(ok)} ${detailWithOptional}`);
 
   const toolResults = {};
   for (const [name, r] of results.entries()) toolResults[name] = r;
-  return { ok, ms, detail, failedTools: failedNames.slice(0, 12), failedToolsTruncated: failedNames.length > 12, toolResults };
+  return {
+    ok,
+    ms,
+    detail: detailWithOptional,
+    failedTools: failedNames.slice(0, 12),
+    failedToolsTruncated: failedNames.length > 12,
+    toolResults
+  };
 }
 
 module.exports = { selfTestToolsModelExec };
-

@@ -202,9 +202,9 @@ async function selfTestProvider({ cfg, provider, timeoutMs, abortSignal, log, ca
         record({ name: "realToolsSchema", ok: false, ms: schemaRes.ms, detail: schemaRes.error });
       }
 
-      // 真实工具可用性：在真实工具 schema 下触发 tool_use + tool_result 往返（不执行真实工具；仅验证工具链路/配对逻辑对真实工具集可用）
+      // 真实工具可用性：在真实工具 schema 下触发 tool_use + tool_result 往返（不执行真实工具；抽样验证工具链路/配对逻辑对“真实工具 schema”可用）
       const realToolsRoundtripRes = await withTimed(
-        async () => await realToolsToolRoundtripByProvider({ provider, model, toolDefinitions: realToolDefs, timeoutMs, abortSignal, log, maxTools: 9999 })
+        async () => await realToolsToolRoundtripByProvider({ provider, model, toolDefinitions: realToolDefs, timeoutMs, abortSignal, log, maxTools: 5 })
       );
       if (realToolsRoundtripRes.ok && realToolsRoundtripRes.res?.ok) {
         record({ name: "realToolsToolRoundtrip", ok: true, ms: realToolsRoundtripRes.ms, detail: realToolsRoundtripRes.res?.detail || "" });

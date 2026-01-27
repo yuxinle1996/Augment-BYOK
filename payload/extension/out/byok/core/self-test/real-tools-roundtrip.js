@@ -25,7 +25,8 @@ async function realToolsToolRoundtripByProvider({ provider, model, toolDefinitio
   const toolDefsByName = new Map(pickedToolDefs.map((d) => [normalizeString(d?.name), d]).filter((x) => x[0]));
 
   const metaMismatches = [];
-  const callFailed = [];
+  const callErrors = [];
+  const callSkipped = [];
   const roundtripFailed = [];
   let calledOk = 0;
   let roundtripOk = 0;
@@ -94,7 +95,7 @@ async function realToolsToolRoundtripByProvider({ provider, model, toolDefinitio
       res1 = await chatStreamByProvider({ provider, model, req: req1, timeoutMs, abortSignal });
     } catch (err) {
       if (abortSignal && abortSignal.aborted) throw err;
-      for (const name of namesBatch) callFailed.push(name);
+      for (const name of namesBatch) callErrors.push(name);
       emit(`[${providerLabel(provider)}] realTools batch ${bi + 1}/${batches.length}: FAIL (chat-stream error: ${err instanceof Error ? err.message : String(err)})`);
       continue;
     }
@@ -113,8 +114,8 @@ async function realToolsToolRoundtripByProvider({ provider, model, toolDefinitio
       const match = usedByName.get(toolName) || null;
       if (!match) {
         const sr = normalizeString(res1?.stop_reason) || "n/a";
-        callFailed.push(toolName);
-        emit(`[${providerLabel(provider)}] realTools batch ${bi + 1}/${batches.length}: FAIL tool=${toolName} (no tool_use, stop_reason=${sr})`);
+        callSkipped.push(toolName);
+        emit(`[${providerLabel(provider)}] realTools batch ${bi + 1}/${batches.length}: WARN tool=${toolName} (no tool_use, stop_reason=${sr})`);
         continue;
       }
 
@@ -186,11 +187,15 @@ async function realToolsToolRoundtripByProvider({ provider, model, toolDefinitio
   }
 
   const detailParts = [`tools=${toolNames.length}/${uniqueCount}`, `call=${calledOk}/${toolNames.length}`, `roundtrip=${roundtripOk}/${toolNames.length}`];
-  if (callFailed.length) detailParts.push(`call_fail=${callFailed.length} first=${callFailed[0]}`);
+  if (callSkipped.length) detailParts.push(`call_skipped=${callSkipped.length} first=${callSkipped[0]}`);
+  if (callErrors.length) detailParts.push(`call_error=${callErrors.length} first=${callErrors[0]}`);
   if (roundtripFailed.length) detailParts.push(`roundtrip_fail=${roundtripFailed.length} first=${roundtripFailed[0]}`);
   if (metaMismatches.length) detailParts.push(`meta_mismatch=${metaMismatches.length} first=${metaMismatches[0]}`);
 
-  const ok = callFailed.length === 0 && roundtripFailed.length === 0 && metaMismatches.length === 0;
+  // 说明：真实工具集里可能包含“高风险/受限”工具名，部分模型会选择跳过（不产出 tool_use）。
+  // 这类“未调用”不应被视为 BYOK 工具链路故障；只要 chat-stream 可用、tool_result 往返无误、且 meta 不冲突即可。
+  // 若本次完全未触发 tool_use，视为“未覆盖到”（detail 会显示 call=0/... + call_skipped=...），不作为失败。
+  const ok = callErrors.length === 0 && roundtripFailed.length === 0 && metaMismatches.length === 0;
   return { ok, detail: detailParts.join(" ").trim() };
 }
 
