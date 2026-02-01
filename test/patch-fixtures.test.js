@@ -268,19 +268,19 @@ test("patchOfficialOverrides: applies expected replacements and is idempotent", 
       `}`,
       ``,
       `class ApiClient{`,
-      `  async makeAuthenticatedCall(t,r,n,i="POST",o){`,
-      `    const a="https://example.com/";`,
-      `    const l=new URL(t,a)`,
-      `    const d={status:500,statusText:"ERR"}`,
-      "    throw new st(`API call failed: ${d.statusText}`,Xe.Internal)",
+      `  async makeAuthenticatedCall(t,r,n,i="POST",o,s){`,
+      `    const c="https://example.com/";`,
+      `    const u=new URL(t,c)`,
+      `    const f={status:500,statusText:"ERR"}`,
+      "    throw new at(`API call failed: ${f.statusText}`,Ye.Internal)",
       `  }`,
       `  async makeAuthenticatedCallStream(t,r,n,i="post",o){`,
       `    const c={tenantUrl:"https://example.com/"};`,
       `    const u=new URL(t,c.tenantUrl)`,
       `    const f={status:500,statusText:"ERR"}`,
-      "    throw new st(`API call failed: ${f.statusText}`,Xe.Internal)",
+      "    throw new at(`API call failed: ${f.statusText}`,Ye.Internal)",
       `    const h={status:500,statusText:"ERR"}`,
-      "    throw new st(`API call failed: ${h.statusText}`,Xe.Internal)",
+      "    throw new at(`API call failed: ${h.statusText}`,Ye.Internal)",
       `  }`,
       `  async callApi(p0,p1,p2,p3,p4,baseUrl,p6,p7,p8,p9,apiToken){`,
       `    return {baseUrl,apiToken};`,
@@ -305,11 +305,10 @@ test("patchOfficialOverrides: applies expected replacements and is idempotent", 
     assert.ok(!out1.includes("return this.configListener.config.apiToken"));
     assert.ok(!out1.includes("return this.configListener.config.completionURL"));
 
-    assert.ok(!out1.includes("new URL(t,a)"));
+    assert.ok(!out1.includes("new URL(t,c)"));
     assert.ok(!out1.includes("new URL(t,c.tenantUrl)"));
     assert.ok(out1.includes("t.slice(1)"));
 
-    assert.ok(out1.includes("API call failed: ${d.status} ${d.statusText}"));
     assert.ok(out1.includes("API call failed: ${f.status} ${f.statusText}"));
     assert.ok(out1.includes("API call failed: ${h.status} ${h.statusText}"));
 

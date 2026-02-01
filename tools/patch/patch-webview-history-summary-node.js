@@ -21,18 +21,16 @@ function patchExtensionClientContextAsset(filePath) {
   let out = original;
 
   // 兼容上游小版本变更：不强依赖整段变量名（N/F/aS/rS 等），只替换“把 payload C 存入 HISTORY_SUMMARY 节点”的那一小段。
-  // 目标：U={id:0,type:Ce.HISTORY_SUMMARY,history_summary_node:C} -> U={id:0,type:Ce.TEXT,text_node:{content:V5(C)}}
+  // 目标：U={id:0,type:Ie.HISTORY_SUMMARY,history_summary_node:C} -> U={id:0,type:Ie.TEXT,text_node:{content:k3(C)}}
   //
-  // NOTE: V5 是上游内部函数：把 summary payload 按 message_template 渲染为最终字符串。
-  const summaryNodeRe = /\{id:0,type:Ce\.HISTORY_SUMMARY,history_summary_node:([A-Za-z_$][0-9A-Za-z_$]*)\}/g;
-  const summaryNodeReCamel = /\{id:0,type:Ce\.HISTORY_SUMMARY,historySummaryNode:([A-Za-z_$][0-9A-Za-z_$]*)\}/g;
-  try {
-    out = replaceOnceRegex(out, summaryNodeRe, (m) => `{id:0,type:Ce.TEXT,text_node:{content:V5(${m[1]})}}`, "extension-client-context HISTORY_SUMMARY node slimming");
-  } catch (err) {
-    // fallback to camelCase variant (upstream drift)
-    if (!(err instanceof Error) || !/needle not found/i.test(err.message)) throw err;
-    out = replaceOnceRegex(out, summaryNodeReCamel, (m) => `{id:0,type:Ce.TEXT,text_node:{content:V5(${m[1]})}}`, "extension-client-context HISTORY_SUMMARY node slimming (camel)");
-  }
+  // NOTE: k3 是上游内部函数：把 summary payload 按 message_template 渲染为最终字符串。
+  const summaryNodeRe = /\{id:0,type:Ie\.HISTORY_SUMMARY,history_summary_node:([A-Za-z_$][0-9A-Za-z_$]*)\}/g;
+  out = replaceOnceRegex(
+    out,
+    summaryNodeRe,
+    (m) => `{id:0,type:Ie.TEXT,text_node:{content:k3(${m[1]})}}`,
+    "extension-client-context HISTORY_SUMMARY node slimming"
+  );
 
   out = ensureMarker(out, MARKER);
   fs.writeFileSync(filePath, out, "utf8");

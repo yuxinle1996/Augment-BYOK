@@ -98,7 +98,7 @@ function patchAuthenticatedCallUrlJoin(src) {
 
   const repl = `new URL((typeof t==="string"&&t[0]==="/")?t.slice(1):t,`;
 
-  const res1 = replaceAllOrThrow(out, /new URL\(t,a\)/g, `${repl}a)`, "makeAuthenticatedCall preserve base path");
+  const res1 = replaceAllOrThrow(out, /new URL\(t,c\)/g, `${repl}c)`, "makeAuthenticatedCall preserve base path");
   if (res1.count !== 1) throw new Error(`patch failed: makeAuthenticatedCall match count unexpected (${res1.count})`);
   out = res1.out;
 
@@ -124,7 +124,7 @@ function patchAuthenticatedCallDisabledEndpoints(src) {
     `}catch{}` +
     ``;
 
-  out = injectOnceAfterLiteral(out, `async makeAuthenticatedCall(t,r,n,i="POST",o){`, unaryInjection, "makeAuthenticatedCall disabled endpoints");
+  out = injectOnceAfterLiteral(out, `async makeAuthenticatedCall(t,r,n,i="POST",o,s){`, unaryInjection, "makeAuthenticatedCall disabled endpoints");
 
   const streamInjection =
     `try{` +
@@ -146,32 +146,15 @@ function patchAuthenticatedCallDisabledEndpoints(src) {
 function patchAuthenticatedCallErrorMessages(src) {
   let out = src;
 
-  const res1 = replaceAllOrThrow(
+  const res = replaceAllOrThrow(
     out,
-    /throw new st\(`API call failed: \$\{d\.statusText\}`,Xe\.Internal\)/g,
-    "throw new st(`API call failed: ${d.status} ${d.statusText} (${l.toString()})`,Xe.Internal)",
+    /throw new at\(`API call failed: \$\{([A-Za-z_$][0-9A-Za-z_$]*)\.statusText\}`,Ye\.Internal\)/g,
+    "throw new at(`API call failed: ${$1.status} ${$1.statusText} (${u.toString()})`,Ye.Internal)",
     "makeAuthenticatedCall error message include url"
   );
-  if (res1.count !== 1) throw new Error(`patch failed: makeAuthenticatedCall error message match count unexpected (${res1.count})`);
-  out = res1.out;
-
-  const res2 = replaceAllOrThrow(
-    out,
-    /throw new st\(`API call failed: \$\{f\.statusText\}`,Xe\.Internal\)/g,
-    "throw new st(`API call failed: ${f.status} ${f.statusText} (${u.toString()})`,Xe.Internal)",
-    "makeAuthenticatedCallStream error message include url"
-  );
-  if (res2.count !== 1) throw new Error(`patch failed: makeAuthenticatedCallStream error message match count unexpected (${res2.count})`);
-  out = res2.out;
-
-  const res3 = replaceAllOrThrow(
-    out,
-    /throw new st\(`API call failed: \$\{h\.statusText\}`,Xe\.Internal\)/g,
-    "throw new st(`API call failed: ${h.status} ${h.statusText} (${u.toString()})`,Xe.Internal)",
-    "makeAuthenticatedCallStream retry error message include url"
-  );
-  if (res3.count !== 1) throw new Error(`patch failed: makeAuthenticatedCallStream retry error message match count unexpected (${res3.count})`);
-  out = res3.out;
+  // expected: 3 (unary f + stream h + stream f)
+  if (res.count !== 3) throw new Error(`patch failed: makeAuthenticatedCall error message match count unexpected (${res.count})`);
+  out = res.out;
 
   return out;
 }
